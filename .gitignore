@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# Virtual environment
+venv/
+.venv/
+
+# Secrets - never commit real credentials
+.env
+*.json
+!package.json
+!tsconfig.json
+gcp-service-account*.json
+
+# Data - large/generated, don't belong in git history
+data/raw/*
+!data/raw/.gitkeep
+data/samples/segmented_preview/*
+!data/samples/segmented_preview/.gitkeep
+
+# OS / editor cruft
+.DS_Store
+.vscode/
+*.log
