@@ -12,6 +12,7 @@ dependencies = [
     # only when we actually start using it. Keeping this list
     # accurate as we go (rather than dumping everything in now)
     # means anyone reading it later knows exactly what's really used.
+    "pandas>=2.0",
 ]
 
 [tool.setuptools.packages.find]
