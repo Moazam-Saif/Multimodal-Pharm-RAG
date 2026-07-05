@@ -6,8 +6,17 @@ scripts in scripts/ into one reusable, tested function. See DEVLOG.md
 for the full investigation trail explaining every decision below.
 
 Data sources:
-    - data/raw/epillid_data.zip       (images + ground truth labels)
-    - data/raw/pillbox_metadata.csv   (text metadata, joined by NDC)
+    - epillid_data.zip       (images + ground truth labels)
+    - pillbox_metadata.csv   (text metadata, joined by NDC)
+
+File locations are configurable via environment variables (see
+.env.example), defaulting to the local project layout
+(data/raw/...). This matters because this module runs in more than
+one place with different filesystems - locally (Windows, files live
+under the project's data/raw/) and in Colab (files live under a
+mounted Google Drive path instead). Originally these paths were
+hardcoded, which broke silently the first time this code ran in Colab
+- see DEVLOG.md Phase 2 notes for that incident.
 
 Scope (confirmed working end-to-end, see DEVLOG.md "FINAL Phase 1
 dataset decision"):
@@ -16,17 +25,22 @@ dataset decision"):
     - Text metadata recovered for ~96.8% of these via NDC join
 """
 
+import os
 import re
 import zipfile
 from pathlib import Path
 
 import pandas as pd
 
-EPILLID_ZIP = Path("data/raw/epillid_data.zip")
+EPILLID_ZIP = Path(
+    os.environ.get("EPILLID_ZIP_PATH", "data/raw/epillid_data.zip")
+)
 EPILLID_LABELS_INSIDE_ZIP = "ePillID_data/all_labels.csv"
 EPILLID_IMAGE_PREFIX_INSIDE_ZIP = "ePillID_data/classification_data/"
 
-PILLBOX_METADATA_CSV = Path("data/raw/pillbox_metadata.csv")
+PILLBOX_METADATA_CSV = Path(
+    os.environ.get("PILLBOX_METADATA_CSV_PATH", "data/raw/pillbox_metadata.csv")
+)
 
 # Pillbox text fields we want to recover per pill - see DEVLOG for why
 # these specific fields (medicine_name, spl_strength, spl_ingredients
