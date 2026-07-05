@@ -305,14 +305,133 @@ Verified via `python -m pillrag.data`:
 Added `pandas>=2.0` to pyproject.toml as a real project dependency (was
 already added locally when first inspecting the metadata CSV).
 
+## Phase 2: Background Segmentation
+
+### Visual inspection of real images (before any code)
+
+Extracted and looked at 12 real sample images (6 reference + 6 consumer,
+random seed 42 for reproducibility) via `scripts/extract_sample_images.py`
+to check our assumptions before building anything.
+
+**Finding: background style does NOT cleanly split along reference vs
+consumer lines**, contrary to initial assumption. Observed across the
+sample:
+- Reference images: mix of flat gray, flat pale gray-green, solid black,
+  and black-bar-top-bottom-with-gray-middle patterns
+- Consumer images: mostly similarly clean (solid black, black bars), but
+  2 of 6 showed genuine real-world surfaces (tan textured table, reddish
+  woven fabric) - these are the only samples that looked like true
+  "messy real-world" photos
+
+**Conclusion**: most images are already fairly controlled/clean, but a
+real minority have genuine varied backgrounds - segmentation is still
+necessary (a naive "crop out black pixels" shortcut would fail on the
+gray-background and real-surface images), and still valuable to learn
+properly since real end-user query photos (the actual eventual use case)
+will look like the messy consumer examples, not the clean references.
+
+### Tooling decision: Ultralytics FastSAM
+
+Chose **Ultralytics's FastSAM integration** over the original research
+repo. Reasoning: official, well-documented, actively maintained API
+(`from ultralytics import FastSAM`), consistent with the broader
+Ultralytics/YOLO ecosystem (transferable skill), vs. the original
+FastSAM repo which is closer to unmaintained research code with rougher
+setup.
+
+Confirmed via docs.ultralytics.com/models/fast-sam (checked live, not
+from training memory - see working-instructions rule #3):
+- API: `model = FastSAM("FastSAM-x.pt")`, then `model(image_path)` for
+  "segment everything" mode, or `model.predict(path, bboxes=...)` for
+  prompted segmentation
+- FastSAM decouples into 2 stages: all-instance segmentation (via
+  YOLOv8-seg backbone) + prompt-guided selection - for our simple
+  one-pill-per-image case, "everything" mode + picking the largest mask
+  should suffice, no bbox/point prompts needed
+- **Known gotcha** (from an Ultralytics GitHub discussion): image
+  dimensions not a multiple of 32 can cause a rare runtime error. Our
+  ePillID images are 224x224, and 224/32=7 exactly - safe for THIS
+  dataset, but worth remembering if processing differently-sized images
+  later (e.g. a real user's uploaded query photo won't be a clean 224x224)
+
+**Weight size decision: FastSAM-x** (larger/more accurate) over
+FastSAM-s (smaller/faster). Reasoning: our task doesn't need real-time
+speed (one-time batch job, not live inference), correctness matters more
+here, and switching to -s later is a one-line change if -x proves too
+slow on Colab's free-tier GPU.
+
+### Colab environment setup (done)
+
+- New Colab notebook, Runtime → Change runtime type → **T4 GPU** (free
+  tier - confirmed via `!nvidia-smi`: Tesla T4, 15,360 MiB, 0% used)
+- Uploaded `epillid_data.zip` via `google.colab.files.upload()` (153MB,
+  direct browser upload - fine for a single-session experiment; will
+  reconsider Google Drive mounting if we need persistence across
+  multiple Colab sessions later)
+- `!unzip -q epillid_data.zip -d data` - confirmed same top-level
+  structure as found locally (`ePillID_data/`)
+- `!pip install ultralytics` - clean install (ultralytics 8.4.87). Colab
+  already had PyTorch pre-installed with CUDA 12.8 support built in - no
+  manual GPU/driver setup needed, unlike a fresh local machine
+- `FastSAM("FastSAM-x.pt")` - auto-downloaded weights (138MB) from
+  Ultralytics' GitHub releases on first use, ~3 seconds
+
+### First real FastSAM test - important finding: naive mask selection fails
+
+Ran FastSAM on one known reference image (the blue/white capsule sample
+we'd already visually inspected locally, back in the very first sample
+extraction). Result: **4 objects detected**, not 1, as expected from a
+single-pill photo:
+
+| Mask | Area (px) | Confidence | What it actually is (confirmed via isolated visualization) |
+|---|---|---|---|
+| 0 | 139,640 | 0.9352 | Left half of the capsule (rounded-left, correct shape) |
+| 1 | 334,289 | 0.8969 | **NOT the pill** - a full-width horizontal band artifact, likely from the black-bars-top-and-bottom image composition (see Phase 2 visual inspection notes above) |
+| 2 | 147,517 | 0.8963 | Right half of the capsule (rounded-right, correct shape, mirrors Mask 0) |
+| 3 | 23,058 | 0.2931 | Low-confidence, likely a redundant/lower-quality duplicate of Mask 0's region |
+
+**Root cause of the split**: the capsule's two halves are different, high-
+contrast colors (blue vs white). FastSAM appears to be segmenting each
+color region as its own object rather than recognizing "one capsule" as
+a whole - understandable, since FastSAM has no pill-specific training,
+it's a general-purpose segmenter.
+
+**Initial hypothesis rejected with evidence, not assumed**: "just pick
+the largest mask by area" seemed like a clean rule (tested via
+`.sum(dim=(1,2)).argmax()`), but visualizing that specific mask in
+isolation revealed it was the band artifact (Mask 1), not the pill -
+it's large simply because it's a big rectangle, not because it's the
+correct/complete object. This disproves area-alone as a selection
+criterion.
+
+**Correct understanding**: for this image, the real pill = Mask 0 +
+Mask 2 combined (the two genuine half-capsule shapes). Mask 1 (band) and
+Mask 3 (low-confidence duplicate) are both noise to reject.
+
+**Not yet solved**: a general, reliable rule for picking/combining the
+correct mask(s) across all 5,728 images, most of which won't be
+two-colored capsules (many are round, single-colored tablets - simpler
+shapes that may not split this way at all). Need to test against a
+wider variety of sample images before deciding a general rule such as
+"reject any mask touching all 4 image edges" + "reject low confidence" +
+"merge remaining masks."
+
 ### Open / next steps
 
-- [ ] Decide: use LLM (Gemini) to enrich the recovered but terse Pillbox
-      text fields (medicine_name, spl_strength, spl_ingredients) for
-      better Phase 5 text RAG quality? (still open from original plan)
-- [ ] Revisit MEDISEG in Phase 2, specifically for validating our own
-      FastSAM segmentation output against its real ground-truth masks
-- [ ] Begin Phase 2: FastSAM background segmentation
+- [ ] Test FastSAM on the other sample images we already visually
+      inspected (round tablets, oval tablets, single-color pills, and
+      the genuinely messy real-world-background consumer images) to see
+      if the "split into color regions" problem is capsule-specific or
+      more general
+- [ ] Test the "reject band artifacts touching all 4 edges + reject low
+      confidence + merge remaining masks" hypothesis against those wider
+      samples
+- [ ] Once a reliable selection rule is found, write it as real
+      `pillrag` package code (not just notebook cells), consistent with
+      how `data.py` consolidated the Phase 1 diagnostic work
+- [ ] Batch-process all 5,728 images once the rule is validated
+- [ ] Revisit MEDISEG dataset for validating segmentation quality against
+      real ground-truth masks (deferred from Phase 1)
 
 ### Decision: text metadata source for ePillID pills
 
@@ -476,7 +595,3 @@ a hard-to-detect quality issue, not a hard crash. Since we lack raw
 unrecoverable from pillbox_images.zip, see NDC join investigation above),
 we can't reprocess them consistently even if we wanted to. Fully deferred,
 not just for text.
-
-
-
-
