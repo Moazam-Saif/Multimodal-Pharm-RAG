@@ -390,12 +390,201 @@ masks (image-wide blob, horizontal band) are consistently LOW confidence
 separate high-confidence masks (both need to be kept and merged), not
 just one.
 
-**Proposed selection rule** (not yet implemented/tested at scale):
+**Proposed selection rule** (TESTED, FAILED - see below):
 1. Filter out any mask below a confidence threshold (candidate: ~0.6-0.7,
    comfortably separates real detections from artifacts in all 3 tests)
 2. Merge all remaining masks together (union) into one final pill mask -
    handles both the "one clean mask" case and the "split into
    same-object parts" case without needing to distinguish them
+
+### Confidence-only rule tested and FAILED - band artifact has mid-range confidence too
+
+Implemented `get_pill_mask()` (confidence threshold 0.6 + union merge) and
+tested against the capsule case specifically (our hardest known case,
+with the band artifact). **Result: failed.** The band artifact (Mask 1,
+confidence 0.8969) survived the 0.6 threshold right alongside the two
+genuine capsule halves (0.9352, 0.8963) - only the truly-spurious
+duplicate mask (0.2931) got correctly filtered. Since we merge via union
+(`.max(axis=0)`), the band swallowed the whole result into one giant
+rectangle again - same failure as our very first "pick largest mask"
+attempt, just reached a different way.
+
+**Real lesson**: confidence score alone cannot distinguish "genuine
+object part" from "band/frame artifact" - both can score similarly high.
+Need an additional, shape-based signal specifically to catch the band
+artifact. Hypothesis to test next: the band artifact spans the full
+image width edge-to-edge with a straight border, which real pill shapes
+(even irregular ones) shouldn't do - candidate rule: reject any mask
+that touches both the left AND right edges of the image across a wide
+vertical span.
+
+### Area-sum rule (user's idea) tested directly in notebook - worked, but with a caveat
+
+User proposed: among confident masks, if two have similar area and a
+third is close to DOUBLE that, the two are likely parts of one whole
+object. Rejected the earlier edge-touching/aspect-ratio ideas first on
+principle (would misfire on a real up-close user photo - framing-
+dependent signals are fragile). Tested area-sum idea directly against
+real numbers in the notebook: correctly found mask 1 (334,289 px) ≈
+mask 0 + mask 2 (139,640 + 147,517 = 287,157, ~16% difference, within a
+30% tolerance) → correctly identified 0+2 as parts, 1 as whole.
+
+**However**: this success came from a naive first-draft loop that
+returns on the FIRST valid pairing found, without checking whether OTHER
+pairings might also satisfy the same tolerance (a real weakness, plus a
+numpy uint64 overflow bug on a failed comparison earlier in the same
+loop - both noted for the "harden into real module" pass).
+
+### MISTAKE: shipped "hardened" segment.py without re-testing - caught by user
+
+Wrote `src/pillrag/segment.py`'s `select_pill_mask()` to fix the two
+known bugs above (overflow, first-match-wins) and presented it as done.
+**Did not re-verify it against the capsule case before doing so** - a
+real lapse, caught by the user, not by me. Tested in Colab: it
+reproduced the EXACT same failure as the ORIGINAL naive rule, selecting
+Mask 1 (the band artifact) as "whole" with masks 0+2 as its "parts" -
+identical wrong answer, differently arrived at.
+
+**Root cause**: fixing the overflow and first-match-wins bugs never
+addressed the actual underlying flaw - the area-sum arithmetic itself is
+ambiguous. Band area (334,289) vs the real halves' sum (287,157) is
+~16% apart, comfortably inside the 30% tolerance - these exact numbers
+were already sitting in this devlog from the original notebook test,
+and should have been checked against the new code before calling it
+fixed.
+
+**Real fix needed, not yet implemented**: area-sum matching alone is
+insufficient. Need a genuine geometric relationship check - do the
+proposed "parts" masks actually spatially touch/overlap each other, the
+way two halves of one physical object necessarily would? A coincidental
+band artifact has no such spatial relationship to the real capsule
+halves, even though its area happens to arithmetically fit.
+
+### Geometric touching/overlap idea tested - ALSO failed
+
+Tested directly in notebook: does the band artifact (mask 1) actually
+touch/overlap the real capsule halves (masks 0, 2), the way two
+unrelated unrelated regions shouldn't, but the way something spatially
+connected to them would?
+
+**Result: yes, heavily** - mask 1 overlaps mask 0 by 139,640 px (= ALL of
+mask 0's area) and mask 2 by 147,517 px (= ALL of mask 2's area). This
+makes sense once understood: the band artifact isn't a random unrelated
+region elsewhere in the image - it's caused by the image's own light/
+dark horizontal composition, which is centered exactly where the real
+pill sits. So it necessarily overlaps the real pill masks heavily; this
+signal cannot separate "artifact caused by the pill's own location" from
+"genuine part of the pill." Ruled out.
+
+**Next hypothesis, not yet tested**: look at the mask's own shape
+REGULARITY rather than its size or position - a rectangle-like band
+should have very straight edges and corners; a pill (even an elongated
+capsule) should have smoothly curved ends. Candidate approach: compare
+each mask's actual pixel area against the area of its own convex hull
+(the tightest convex/bulging shape containing all its pixels) or its own
+bounding-box area - a near-perfect rectangle should have very little
+"wasted space" in its bounding box, while a pill shape (rounded ends)
+should have visibly more.
+
+### Bounding-box fill ratio - tested, WORKS across all 3 known cases
+
+Defined `bounding_box_fill_ratio(mask)` = mask's own pixel area / its own
+bounding box area. Rectangle-like artifacts should be close to 1.0;
+rounded pill shapes should be meaningfully lower. Tested against all
+three real cases we have evidence for, not just the case it was
+designed around:
+
+| Case | Real pill mask(s) | Artifact mask(s) |
+|---|---|---|
+| Capsule (band artifact) | Mask 0: 0.9275, Mask 2: 0.9105 (halves) | Mask 1 (band): **0.9950**, Mask 3 (noise): 0.4569 |
+| Round tablet (clean, single mask) | Mask 0: **0.8079** (close to circle's theoretical π/4 ≈ 0.785) | none present |
+| Consumer photo (whole-image blob artifact) | Mask 0: **0.7900** | Mask 1 (blob): **1.0000** |
+
+**Clean separation confirmed across all 3 cases**: genuine pill shapes
+consistently fall in ~0.79-0.93; band/blob artifacts consistently sit at
+~0.995-1.0. A threshold around 0.97 should reliably separate them.
+Interesting note: Mask 3 (the low-confidence noise fragment in the
+capsule case) has a LOW fill ratio (0.4569) too - suggesting fill ratio
+might independently help catch some noise even without confidence
+filtering, though confidence filtering should still run first as the
+primary noise filter.
+
+**Decision: rebuild `select_pill_mask()` using confidence filtering +
+fill-ratio filtering (reject near-rectangular masks) BEFORE the
+whole/parts area-sum matching runs.** This should let the whole/parts
+logic run only against genuinely pill-shaped candidates, avoiding the
+mistake from the previous attempt where the band artifact was allowed
+into the whole/parts comparison at all.
+
+### Fill-ratio filter tested against all 3 cases together - partial success, new gap found
+
+Implemented the confidence+fill-ratio filter and tested against all 3
+real cases in one pass, BEFORE touching the real module file further
+(applying the lesson from the earlier mistake).
+
+**Round tablet: correct** - single candidate survives (Mask 0), used
+directly.
+**Consumer photo: correct** - band/blob artifact (Mask 1) correctly
+excluded by fill ratio, single genuine candidate (Mask 0) survives, used
+directly.
+**Capsule: still wrong, but differently wrong than before** - fill ratio
+correctly excluded the band artifact (Mask 1) from candidates this time.
+But this left only masks 0 and 2 (the two real halves) as candidates -
+no third "whole capsule" mask remains for `_find_whole_and_parts` to
+match against, since the only mask that had previously looked like "the
+whole" WAS the band artifact we just (correctly) excluded. Result:
+fell through to `highest_confidence_fallback`, returning ONLY mask 0
+(just the left half of the capsule) - not fixed, just failing in a new
+way.
+
+**Real insight**: the assumption that FastSAM always provides a
+separate, correctly-shaped "whole object" mask alongside its "parts" was
+wrong for this image - here, the only mask resembling "the whole" WAS
+the coincidental band artifact. The genuinely correct fix: when multiple
+valid (post-filter) candidate masks remain and none of them individually
+represents the complete pill, MERGE them together directly (union) as
+the final mask, rather than searching for a pre-existing whole mask that
+may not exist. Not yet implemented/tested - see next entry.
+
+### Merge-fallback tested - ALL 3 cases now correct
+
+Added: when multiple valid (post-filter) candidates remain and no
+whole/parts relationship is found among them, merge (union) all of them
+together as the final mask, rather than falling back to a single
+highest-confidence one (which would have thrown away real pill area,
+as seen in the previous entry's capsule failure).
+
+Rewrote `select_pill_mask()` in `src/pillrag/segment.py` with this
+change, AND - applying the lesson from the earlier mistake directly -
+tested the exact updated function against all 3 known cases together,
+in the same Colab session, before touching the real module file again
+or considering it done:
+
+| Case | Method used | Result |
+|---|---|---|
+| Capsule | `merged_candidates`, indices (0, 2) | Correct - complete capsule shape, band excluded |
+| Round tablet | `single`, index (0,) | Correct - only real mask, no artifacts present |
+| Consumer (fabric bg) | `single`, index (0,) | Correct - blob artifact excluded |
+
+All three visually confirmed as clean, correctly-shaped, complete pill
+silhouettes with backgrounds properly excluded.
+
+**Also cleaned up a real code-quality issue found while making this
+fix**: the previous version's `highest_confidence_fallback` branch
+became unreachable dead code once the length==1 case was already
+handled earlier in the function (by the time that branch could run,
+candidate_indices always has length > 1). Removed it rather than leave
+unreachable code in place; `MaskSelectionResult.method` docstring
+updated to list only the 4 actually-reachable values: "single",
+"whole_and_parts", "merged_candidates", "none_valid".
+
+**Current confidence level**: this logic is verified against 3 distinct
+real cases (two-tone capsule + band artifact, clean single-color round
+tablet, consumer photo + whole-image blob artifact). Not yet tested
+against: irregular/scored tablets, oval tablets, multiple genuinely
+overlapping objects in one frame, or a broader random sample across the
+full dataset. Should run against a wider sample before batch-processing
+all 5,728 images, to catch any case this logic doesn't yet handle.
 
 ### Colab environment setup (done)
 

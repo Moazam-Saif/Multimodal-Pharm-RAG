@@ -3,27 +3,46 @@ Phase 2: FastSAM mask post-processing - selecting the correct pill
 mask(s) out of FastSAM's raw "segment everything" output.
 
 See DEVLOG.md "Phase 2: Background Segmentation" for the full
-investigation trail behind this logic - several simpler rules were
-tried and disproven with real evidence before arriving at this one:
+investigation trail behind this logic. Several rules were tried and
+disproven with real evidence before arriving at this one - including
+one case (the "whole/parts area-sum" rule alone) that was shipped once
+already WITHOUT being re-tested against the exact case it was meant to
+fix, and failed identically to the very first naive attempt. That
+mistake is recorded in DEVLOG.md as a reminder: every rule in this file
+must be re-verified against ALL known test cases before being trusted,
+not just reasoned about.
+
+Rejected/superseded approaches, in order tried:
   - "pick the largest mask by area" - failed (largest mask was often a
     background/framing artifact, not the pill)
-  - "keep masks above a confidence threshold, then merge" - failed
-    (artifact masks can have similar confidence to genuine object masks)
+  - "keep masks above a confidence threshold, then merge via union" -
+    failed (artifact masks can have similar confidence to genuine masks)
   - "reject masks touching the image edge" - failed (masks don't
     literally touch the outermost pixel even when they clearly span
     almost the full frame)
   - "reject masks with an extreme width:height aspect ratio relative to
-    the image frame" - rejected on principle before testing: this
-    would misfire on a real up-close user photo, where a genuine pill
-    could legitimately fill most of the frame
+    the image frame" - rejected on principle before testing: would
+    misfire on a real up-close user photo, where a genuine pill could
+    legitimately fill most of the frame
+  - "whole/parts area-sum matching alone" - failed: a coincidental
+    arithmetic fit (band artifact's area happened to be close to the
+    sum of the two real capsule-half areas) produced the same wrong
+    answer as the original naive rule
+  - "geometric touching/overlap between candidate masks" - failed: the
+    band artifact overlaps the real pill masks heavily, because it's
+    CAUSED BY the same region of the image the pill occupies, not
+    spatially separate from it
 
-This module's approach: some photographed pills (e.g. two-tone
-capsules) get split by FastSAM into multiple "part" masks whose areas
-sum to approximately one "whole" mask's area. We detect that
-relationship directly (comparing masks to EACH OTHER, not to fixed
-thresholds or the image frame), which stays valid regardless of how
-close-up or zoomed a photo is - a property none of the earlier
-rejected rules had.
+**What actually works** (tested against 3 distinct real cases - a
+two-tone capsule with a band artifact, a clean single-color round
+tablet, and a consumer photo with a whole-image "blob" artifact):
+bounding-box fill ratio (a mask's own pixel area divided by its own
+bounding box area). Band/blob artifacts are near-perfect rectangles
+(fill ratio ~0.995-1.0); genuine pill shapes, even irregular ones like
+a two-tone capsule half, are meaningfully lower (~0.79-0.93 across all
+3 real test cases). This signal, unlike the rejected ones above, is
+independent of image framing/zoom AND independent of a mask's
+relationship to other masks - it only depends on the mask's own shape.
 """
 
 from __future__ import annotations
@@ -35,6 +54,10 @@ import numpy as np
 
 
 DEFAULT_CONFIDENCE_THRESHOLD = 0.6
+DEFAULT_MAX_FILL_RATIO = 0.97  # masks with bbox fill ratio above this
+                                # are treated as rectangular artifacts,
+                                # not genuine pill shapes - see DEVLOG.md
+                                # for the real test data behind this cutoff
 DEFAULT_AREA_SUM_TOLERANCE = 0.30  # allow 30% difference between a
                                     # candidate "whole" mask's area and
                                     # the sum of its proposed "parts"
@@ -45,18 +68,43 @@ class MaskSelectionResult:
     """The outcome of running mask selection on one FastSAM result.
 
     final_mask: the resolved pill mask (boolean array), or None if no
-        confident mask could be identified at all.
+        valid mask could be identified at all.
     contributing_mask_indices: which of the original raw mask indices
         were used to build final_mask. Useful for debugging/QA - lets
         us re-visualize exactly which raw masks were kept.
-    method: which resolution path was taken - "single", "whole_and_parts",
-        or "highest_confidence_fallback" - so we can track, across a
-        full batch run, how often each case actually occurs.
+    method: which resolution path was taken - "single",
+        "whole_and_parts", "merged_candidates", or "none_valid" - so we
+        can track, across a full batch run, how often each case
+        actually occurs.
     """
 
     final_mask: np.ndarray | None
     contributing_mask_indices: tuple[int, ...]
     method: str
+
+
+def bounding_box_fill_ratio(mask: np.ndarray) -> float:
+    """What fraction of a mask's own bounding box does it actually
+    fill? A near-perfect rectangle (e.g. a band/frame artifact) is
+    close to 1.0. A rounded pill shape - even an irregular one like
+    half a two-tone capsule - is meaningfully lower, since its bounding
+    box has empty corners. Verified against 3 distinct real test cases
+    in DEVLOG.md before being trusted as a filtering signal.
+    """
+    rows_with_content = mask.any(axis=1)
+    cols_with_content = mask.any(axis=0)
+
+    if not rows_with_content.any():
+        return 0.0  # empty mask, guard against downstream errors
+
+    row_indices = rows_with_content.nonzero()[0]
+    col_indices = cols_with_content.nonzero()[0]
+
+    bbox_height = int(row_indices[-1] - row_indices[0] + 1)
+    bbox_width = int(col_indices[-1] - col_indices[0] + 1)
+    bbox_area = bbox_height * bbox_width
+
+    return float(mask.sum()) / bbox_area
 
 
 def _mask_areas(masks: np.ndarray) -> dict[int, int]:
@@ -68,28 +116,35 @@ def _mask_areas(masks: np.ndarray) -> dict[int, int]:
 
 
 def _find_whole_and_parts(
-    confident_indices: list[int],
+    candidate_indices: list[int],
     areas: dict[int, int],
     tolerance: float,
 ) -> tuple[int, tuple[int, int]] | None:
     """Look for a mask whose area approximately equals the SUM of two
-    other confident masks' areas. Returns (whole_index, (part_a, part_b))
-    for the best such relationship found, or None if none exists.
+    other candidate masks' areas. Returns (whole_index, (part_a, part_b))
+    for the best (closest-matching) such relationship found, or None if
+    none exists.
+
+    IMPORTANT: candidate_indices must already be filtered down to masks
+    that passed BOTH confidence and fill-ratio checks before this
+    function runs - this function has no way to distinguish a genuine
+    whole/parts relationship from a coincidental one on its own (this
+    was proven the hard way - see DEVLOG.md - when a band artifact's
+    area coincidentally summed close to two real mask areas). Filtering
+    artifacts out beforehand is what makes this safe to use.
 
     Checks EVERY valid pairing (not just the first one tried) and picks
     the CLOSEST match by area difference, rather than stopping at the
-    first pairing under tolerance - this avoids a false positive being
-    accepted just because it happened to be tested first, which was a
-    real weakness in this function's first draft (see DEVLOG.md).
+    first pairing under tolerance.
     """
     best_match: tuple[int, tuple[int, int], float] | None = None  # (whole, parts, diff_frac)
 
-    for part_a, part_b in itertools.combinations(confident_indices, 2):
+    for part_a, part_b in itertools.combinations(candidate_indices, 2):
         pair_sum = areas[part_a] + areas[part_b]
         if pair_sum == 0:
             continue  # guard against empty masks, avoid division by zero below
 
-        for candidate_whole in confident_indices:
+        for candidate_whole in candidate_indices:
             if candidate_whole in (part_a, part_b):
                 continue
 
@@ -110,28 +165,49 @@ def select_pill_mask(
     confidences: np.ndarray,
     masks: np.ndarray,
     confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    max_fill_ratio: float = DEFAULT_MAX_FILL_RATIO,
     area_sum_tolerance: float = DEFAULT_AREA_SUM_TOLERANCE,
 ) -> MaskSelectionResult:
     """Resolve FastSAM's raw multi-mask output down to one final pill
-    mask, using confidence filtering plus the whole/parts area
-    relationship described in this module's docstring.
+    mask.
+
+    Pipeline, in order:
+      1. Reject masks below confidence_threshold (noise/low-confidence
+         duplicates - e.g. the 0.29-confidence fragment seen in testing)
+      2. Reject masks above max_fill_ratio (near-rectangular artifacts -
+         e.g. band artifacts and whole-image "blob" detections, BOTH
+         confirmed to reach fill ratios of 0.995-1.0 in real testing,
+         vs. 0.79-0.93 for genuine pill shapes)
+      3. Among what remains: if exactly one mask survives, use it
+         directly. If multiple survive, look for a whole/parts area-sum
+         relationship (handles pills that get split into multiple
+         same-object masks, e.g. a two-tone capsule's two halves plus
+         FastSAM's own separately-detected "whole capsule" mask, when
+         one exists)
+      4. If no whole/parts relationship is found among multiple
+         survivors, merge (union) all of them together as the final
+         mask - confirmed necessary in testing, since FastSAM does not
+         always produce a separate "whole object" mask alongside its
+         parts (see DEVLOG.md)
 
     Args:
         confidences: 1D array of per-mask confidence scores, as returned
             by results[0].boxes.conf.cpu().numpy()
         masks: 3D array of per-mask boolean/binary pixel data, as
             returned by results[0].masks.data.cpu().numpy()
-        confidence_threshold: masks below this are treated as noise and
-            excluded entirely before any further logic runs
+        confidence_threshold: masks below this are excluded before any
+            further logic runs
+        max_fill_ratio: masks with bounding-box fill ratio above this
+            are excluded as likely rectangular artifacts
         area_sum_tolerance: how much difference to allow between a
             candidate "whole" mask's area and the sum of its proposed
-            "parts" areas (see _find_whole_and_parts)
+            "parts" areas
 
     Returns:
-        A MaskSelectionResult. If no mask clears confidence_threshold,
-        final_mask is None - callers must handle this (e.g. flag the
-        image for manual review rather than silently producing a blank
-        or wrong mask).
+        A MaskSelectionResult. final_mask is None if no mask survives
+        both the confidence and fill-ratio filters - callers must
+        handle this case explicitly (e.g. flag the image for manual
+        review) rather than assume a mask always comes back.
     """
     if len(confidences) != len(masks):
         raise ValueError(
@@ -139,17 +215,21 @@ def select_pill_mask(
             f"got {len(confidences)} and {len(masks)}"
         )
 
-    confident_indices = [
-        i for i, conf in enumerate(confidences) if conf >= confidence_threshold
+    fill_ratios = {i: bounding_box_fill_ratio(masks[i]) for i in range(len(masks))}
+
+    candidate_indices = [
+        i
+        for i, conf in enumerate(confidences)
+        if conf >= confidence_threshold and fill_ratios[i] <= max_fill_ratio
     ]
 
-    if not confident_indices:
+    if not candidate_indices:
         return MaskSelectionResult(
-            final_mask=None, contributing_mask_indices=(), method="none_confident"
+            final_mask=None, contributing_mask_indices=(), method="none_valid"
         )
 
-    if len(confident_indices) == 1:
-        idx = confident_indices[0]
+    if len(candidate_indices) == 1:
+        idx = candidate_indices[0]
         return MaskSelectionResult(
             final_mask=masks[idx].astype(bool),
             contributing_mask_indices=(idx,),
@@ -158,31 +238,36 @@ def select_pill_mask(
 
     areas = _mask_areas(masks)
     whole_and_parts = _find_whole_and_parts(
-        confident_indices, areas, area_sum_tolerance
+        candidate_indices, areas, area_sum_tolerance
     )
 
     if whole_and_parts is not None:
         whole_idx, part_indices = whole_and_parts
-        # Use the WHOLE mask directly, not a union of the parts - the
-        # whole mask is FastSAM's own detection of the complete object
-        # and should already be a cleaner, single coherent shape than
-        # a union of two separately-detected part masks would be.
         return MaskSelectionResult(
             final_mask=masks[whole_idx].astype(bool),
             contributing_mask_indices=(whole_idx, *part_indices),
             method="whole_and_parts",
         )
 
-    # Fallback: multiple confident masks, but none fit the whole/parts
-    # pattern (e.g. genuinely multiple separate objects in frame, or a
-    # relationship this module doesn't yet model). Rather than guess,
-    # fall back to the single highest-confidence mask - a defensible,
-    # explicit default that we can specifically audit later by
-    # filtering on method == "highest_confidence_fallback" across a
-    # batch run, to see how often this path is actually taken.
-    best_idx = max(confident_indices, key=lambda i: confidences[i])
+    # No whole/parts relationship found. This does NOT necessarily mean
+    # one of the candidates is spurious - it may simply mean FastSAM
+    # never produced a separate "whole object" mask at all (confirmed
+    # to happen in real testing - see DEVLOG.md: a two-tone capsule
+    # split into exactly two half-masks with no third "whole" mask
+    # among the valid candidates, once the coincidental band artifact
+    # was correctly filtered out). The correct final mask in this
+    # situation is the UNION of all valid candidates - verified visually
+    # to reconstruct the complete pill shape correctly in that test case.
+    #
+    # Note: by this point candidate_indices always has length > 1 (the
+    # length == 1 case returned earlier above), so this always runs -
+    # there is no remaining "single leftover candidate" case to handle
+    # separately.
+    combined = np.zeros_like(masks[candidate_indices[0]], dtype=bool)
+    for idx in candidate_indices:
+        combined |= masks[idx].astype(bool)
     return MaskSelectionResult(
-        final_mask=masks[best_idx].astype(bool),
-        contributing_mask_indices=(best_idx,),
-        method="highest_confidence_fallback",
+        final_mask=combined,
+        contributing_mask_indices=tuple(candidate_indices),
+        method="merged_candidates",
     )
