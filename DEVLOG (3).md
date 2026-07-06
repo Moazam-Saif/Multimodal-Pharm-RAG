@@ -690,20 +690,95 @@ the only things that reliably persist.
 call in Colab now returns the same numbers as locally - 5728 total rows,
 5544 with recovered text metadata.
 
+### Wide random sample (15 images) tested against the verified selection logic
+
+Tested the pushed, verified `select_pill_mask()` against a genuinely
+random sample of 15 images (seed 123, different from the earlier
+hand-picked test cases) to check for failure modes beyond our 3 known
+cases before committing to a full batch run.
+
+**Result: 9 "single", 3 "merged_candidates", 3 "none_valid".** The 3
+`none_valid` cases were investigated individually (not assumed) -
+visualized each one's original photo + all raw masks.
+
+**Finding: all 3 failures are white/off-white pills on a white/light-
+gray background** - a real, known, actively-researched computer vision
+limitation (confirmed via web search - multiple papers describe this
+exact "low visual contrast between foreground and background" problem
+as a documented weakness of the SAM/FastSAM model family in general, not
+specific to our setup or fixable by threshold-tuning). One 2026 paper
+found via search is actively researching exactly this gap.
+
+**Classical CV fallback investigated as a second-attempt technique**
+(since FastSAM structurally cannot help here, regardless of our
+post-processing logic):
+- Tried Otsu's thresholding first - found a clear, confident boundary,
+  but it traced the pill's DROP SHADOW, not the pill itself (visually
+  confirmed - the detected region was a crescent shape matching the
+  shadow under the pill's curved edge, not the pill's circular outline)
+- Tried Canny edge detection instead - successfully traced most of the
+  pill's actual rim, even though contrast is low (edge detection
+  responds to rate-of-change, not absolute brightness difference,
+  which suits subtle shading transitions better than thresholding does)
+- Tried Hough Circle Transform (`cv2.HoughCircles`) on the same image -
+  **successfully found the pill's true circular boundary**, visually
+  confirmed near-perfect against the real pill edge, correctly
+  excluding the shadow. This works even from a partial/noisy edge
+  trace, since Hough Circles is specifically designed to find circles
+  from incomplete boundary evidence via a voting mechanism.
+
+**Decision**: use Hough Circle detection as a fallback specifically for
+ROUND pills when FastSAM's primary logic returns `none_valid`. Oval/
+capsule shapes will need a different classical technique (e.g. ellipse
+fitting) - not yet tested.
+
+### IMPORTANT SCOPE NOTE: shape-based routing only applies to offline indexing, not live queries
+
+User raised a sharp, important point worth recording clearly, since
+it's easy to forget later: using Pillbox's known `shape` field
+(round/oval/capsule) to pick a classical-CV fallback technique is
+legitimate ONLY while building our reference index (Phase 2/3 batch
+processing), where we already know each pill's identity and shape from
+metadata beforehand.
+
+**This does NOT apply to real end-user query photos** (the actual
+product use case, Phase 6/7+) - a user photographing an unknown pill
+means we don't know its shape either, since determining the pill's
+identity (which implies its shape) IS the point of the query. Using
+shape to help segment a query photo would be circular reasoning.
+
+**Decision for later (Phase 6/7, not now)**: for live query photos,
+either (a) try multiple shape-agnostic classical fallbacks and pick
+whichever produces the most confident/sensible result, or (b) simply
+ask the user what shape their pill is via a UI prompt - a common,
+reasonable pattern in real pill-identifier apps, and useful for
+narrowing RAG retrieval candidates too, not just segmentation. Not
+decided yet, revisit when we reach the API/frontend phases.
+
+### `pillrag.data` extended with shape field (for offline routing only)
+
+Added `shape` column to `build_pill_dataset()`'s output, using the same
+prefer-`pillbox_*`-fallback-to-`spl*` rule established in Phase 1 for
+the shape-text column pair (`pillbox_shape_text` populated only when
+NLM visually verified against a real photo; `splshape_text` is the
+manufacturer-submitted original). Implemented via pandas' `.fillna()` -
+`df["pillbox_shape_text"].fillna(df["splshape_text"])`.
+
 ### Open / next steps
 
-- [ ] Test FastSAM on the other sample images we already visually
-      inspected (round tablets, oval tablets, single-color pills, and
-      the genuinely messy real-world-background consumer images) to see
-      if the "split into color regions" problem is capsule-specific or
-      more general
-- [ ] Test the "reject band artifacts touching all 4 edges + reject low
-      confidence + merge remaining masks" hypothesis against those wider
-      samples
-- [ ] Once a reliable selection rule is found, write it as real
-      `pillrag` package code (not just notebook cells), consistent with
-      how `data.py` consolidated the Phase 1 diagnostic work
-- [ ] Batch-process all 5,728 images once the rule is validated
+- [ ] Check the real shape distribution across our 1,000 pill types
+      (round vs oval vs capsule vs other) to know how much of the
+      low-contrast problem Hough Circles alone can address
+- [ ] Investigate an ellipse-fitting classical technique for oval/
+      capsule-shaped low-contrast pills (Hough Circles only handles
+      round shapes)
+- [ ] Wire the Hough Circle (and eventual ellipse) fallback into
+      `segment.py` properly, triggered when `select_pill_mask()` returns
+      `none_valid` AND the pill's known shape (offline indexing only)
+      indicates which classical technique to try
+- [ ] Re-test the full pipeline (FastSAM primary + classical fallback)
+      against the same 3 `none_valid` wide-sample cases, plus a fresh
+      wider sample, before batch-processing all 5,728 images
 - [ ] Revisit MEDISEG dataset for validating segmentation quality against
       real ground-truth masks (deferred from Phase 1)
 

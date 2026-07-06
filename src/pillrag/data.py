@@ -47,6 +47,16 @@ PILLBOX_METADATA_CSV = Path(
 # are the most useful for Phase 5 text RAG; more can be added later)
 PILLBOX_TEXT_FIELDS = ["medicine_name", "spl_strength", "spl_ingredients"]
 
+# Shape is needed for Phase 2 (choosing a classical-CV fallback technique
+# per shape when FastSAM's confidence/fill-ratio filtering can't find a
+# usable mask - e.g. Hough Circle detection for round pills). Pillbox has
+# TWO shape columns per Phase 1's investigation: pillbox_shape_text is
+# only populated when NLM visually verified the shape against a real
+# photo and found it differs from the label; spl_shape_text is what the
+# manufacturer originally submitted. Established rule (see DEVLOG.md
+# Phase 1): prefer pillbox_* when present (visually verified), fall back
+# to spl* otherwise.
+
 
 def _digits_only(s: str) -> str:
     """Strip everything except digits from a string."""
@@ -107,6 +117,12 @@ def load_pillbox_text_lookup() -> pd.DataFrame:
         df["product_code"].dropna().astype(str).apply(_normalize_ndc)
     )
     df = df[df["ndc_normalized"].notna()]
+
+    # Resolve shape: prefer pillbox_shape_text (visually verified),
+    # fall back to splshape_text (as manufacturer-submitted) - see
+    # DEVLOG.md Phase 1 for why this specific fallback direction.
+    df["shape"] = df["pillbox_shape_text"].fillna(df["splshape_text"])
+
     return df.drop_duplicates("ndc_normalized").set_index("ndc_normalized")
 
 
@@ -125,7 +141,7 @@ def build_pill_dataset() -> pd.DataFrame:
     pillbox_lookup = load_pillbox_text_lookup()
 
     merged = epillid.merge(
-        pillbox_lookup[PILLBOX_TEXT_FIELDS],
+        pillbox_lookup[[*PILLBOX_TEXT_FIELDS, "shape"]],
         how="left",
         left_on="ndc_normalized",
         right_index=True,
@@ -139,6 +155,7 @@ def build_pill_dataset() -> pd.DataFrame:
             "is_ref",
             "is_front",
             *PILLBOX_TEXT_FIELDS,
+            "shape",
         ]
     ]
 
