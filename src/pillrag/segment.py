@@ -61,6 +61,15 @@ DEFAULT_MAX_FILL_RATIO = 0.97  # masks with bbox fill ratio above this
 DEFAULT_AREA_SUM_TOLERANCE = 0.30  # allow 30% difference between a
                                     # candidate "whole" mask's area and
                                     # the sum of its proposed "parts"
+DEFAULT_DOMINANCE_MULTIPLIER = 2.0  # a candidate whose area exceeds
+                                     # this multiple of ALL other
+                                     # candidates' combined area is
+                                     # treated as the whole object
+                                     # directly - see DEVLOG.md for the
+                                     # real failure case (a logo/text
+                                     # fragment coincidentally matching
+                                     # the whole/parts area-sum pattern)
+                                     # that made this check necessary
 
 
 @dataclass
@@ -72,7 +81,7 @@ class MaskSelectionResult:
     contributing_mask_indices: which of the original raw mask indices
         were used to build final_mask. Useful for debugging/QA - lets
         us re-visualize exactly which raw masks were kept.
-    method: which resolution path was taken - "single",
+    method: which resolution path was taken - "single", "dominant",
         "whole_and_parts", "merged_candidates", or "none_valid" - so we
         can track, across a full batch run, how often each case
         actually occurs.
@@ -113,6 +122,39 @@ def _mask_areas(masks: np.ndarray) -> dict[int, int]:
     overflow bug during initial testing when subtracting areas; see
     DEVLOG.md. Plain Python ints have no such overflow risk)."""
     return {i: int(masks[i].sum()) for i in range(len(masks))}
+
+
+def _find_dominant_mask(
+    candidate_indices: list[int],
+    areas: dict[int, int],
+    multiplier: float,
+) -> int | None:
+    """Check whether one candidate's area dramatically exceeds the
+    combined area of every other candidate (by more than `multiplier`
+    times). If so, that mask is almost certainly the complete object on
+    its own, and should be used directly rather than risking the
+    whole/parts area-sum search below - which has no way to distinguish
+    a genuine part-of-object relationship from a coincidental one among
+    small, unrelated fragments (confirmed to happen in real testing:
+    see DEVLOG.md - a dominant pill mask was ignored in favor of three
+    small logo/text fragments whose areas coincidentally summed
+    correctly against each other).
+
+    Returns the dominant mask's index, or None if no single candidate
+    is dramatically larger than the rest (e.g. the two-tone capsule
+    case, where two roughly-equal-sized halves should NOT trigger this -
+    verified: neither half exceeds even 1.5x the other in testing).
+    """
+    total_area = sum(areas[i] for i in candidate_indices)
+
+    for idx in candidate_indices:
+        rest = total_area - areas[idx]
+        if rest == 0:
+            continue  # only one candidate total - handled separately by caller
+        if areas[idx] > rest * multiplier:
+            return idx
+
+    return None
 
 
 def _find_whole_and_parts(
@@ -167,6 +209,7 @@ def select_pill_mask(
     confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
     max_fill_ratio: float = DEFAULT_MAX_FILL_RATIO,
     area_sum_tolerance: float = DEFAULT_AREA_SUM_TOLERANCE,
+    dominance_multiplier: float = DEFAULT_DOMINANCE_MULTIPLIER,
 ) -> MaskSelectionResult:
     """Resolve FastSAM's raw multi-mask output down to one final pill
     mask.
@@ -179,12 +222,21 @@ def select_pill_mask(
          confirmed to reach fill ratios of 0.995-1.0 in real testing,
          vs. 0.79-0.93 for genuine pill shapes)
       3. Among what remains: if exactly one mask survives, use it
-         directly. If multiple survive, look for a whole/parts area-sum
+         directly. If multiple survive, check whether one is DOMINANT
+         (its area exceeds dominance_multiplier times the combined area
+         of all others) - if so, use it directly, skipping the riskier
+         whole/parts search below entirely. This step exists because a
+         real test case (see DEVLOG.md) showed the whole/parts search
+         can find a coincidental match among small, unrelated fragments
+         (e.g. logo/imprint text) even when an obviously-correct,
+         dominant mask (the actual pill) was sitting right there.
+      4. If no single mask is dominant, look for a whole/parts area-sum
          relationship (handles pills that get split into multiple
-         same-object masks, e.g. a two-tone capsule's two halves plus
-         FastSAM's own separately-detected "whole capsule" mask, when
-         one exists)
-      4. If no whole/parts relationship is found among multiple
+         same-object masks, e.g. a two-tone capsule's two roughly-equal
+         halves, verified in testing to correctly NOT trigger the
+         dominance check in step 3, since neither half is dramatically
+         larger than the other)
+      5. If no whole/parts relationship is found among multiple
          survivors, merge (union) all of them together as the final
          mask - confirmed necessary in testing, since FastSAM does not
          always produce a separate "whole object" mask alongside its
@@ -202,6 +254,10 @@ def select_pill_mask(
         area_sum_tolerance: how much difference to allow between a
             candidate "whole" mask's area and the sum of its proposed
             "parts" areas
+        dominance_multiplier: how many times larger than the combined
+            area of all other candidates a single candidate must be to
+            be treated as the whole object directly, skipping the
+            whole/parts search
 
     Returns:
         A MaskSelectionResult. final_mask is None if no mask survives
@@ -237,6 +293,15 @@ def select_pill_mask(
         )
 
     areas = _mask_areas(masks)
+
+    dominant_idx = _find_dominant_mask(candidate_indices, areas, dominance_multiplier)
+    if dominant_idx is not None:
+        return MaskSelectionResult(
+            final_mask=masks[dominant_idx].astype(bool),
+            contributing_mask_indices=(dominant_idx,),
+            method="dominant",
+        )
+
     whole_and_parts = _find_whole_and_parts(
         candidate_indices, areas, area_sum_tolerance
     )

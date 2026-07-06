@@ -764,19 +764,128 @@ NLM visually verified against a real photo; `splshape_text` is the
 manufacturer-submitted original). Implemented via pandas' `.fillna()` -
 `df["pillbox_shape_text"].fillna(df["splshape_text"])`.
 
+### Real shape distribution checked - scope decision made
+
+Checked `df["shape"].value_counts()` across all 5,544 shape-known rows:
+
+| Shape | Count | % of shape-known rows |
+|---|---|---|
+| ROUND | 2,501 | 45.1% |
+| OVAL | 1,986 | 35.8% |
+| CAPSULE | 861 | 15.5% |
+| TRIANGLE, DIAMOND, SQUARE, TEAR, RECTANGLE, HEXAGON, PENTAGON, TRAPEZOID, SEMI-CIRCLE (combined) | 196 | 3.5% |
+
+ROUND + OVAL together = ~81% of the dataset. CAPSULE is a "stadium"
+shape (rectangle + two semicircular ends) - neither a circle nor an
+ellipse, would need its own fitting approach. The remaining shapes are
+individually rare (each under 1% of the dataset).
+
+**Scope decision (proportionate effort principle, same as Phase 1's
+deferred-pills decision)**: build classical-CV fallbacks for ROUND
+(Hough Circles - already confirmed working) and OVAL (ellipse fitting -
+next task) only. CAPSULE and the long tail of rare shapes are
+EXPLICITLY DEFERRED, not silently dropped - documented here as a known,
+acknowledged gap. Together ROUND+OVAL fallback coverage should handle
+the large majority of any low-contrast cases we encounter during the
+full batch run.
+
+### CRITICAL FAILURE FOUND: whole_and_parts matched on logo/text fragments, not the pill
+
+While visually spot-checking a 20-image OVAL wide sample (good instinct
+from user - "single"/"merged_candidates" method labels alone don't prove
+correctness, actual visual confirmation is still required), found a
+serious failure in `oval_test_18` (00172-7311-46, an orange oval capsule
+with a black "50 mg" + hourglass logo imprint): `select_pill_mask()`
+returned method `whole_and_parts`, but the final mask was ONLY the tiny
+black hourglass logo shape - NOT the pill at all. The actual bright-
+orange pill body (which should be an EASY, high-contrast case for
+FastSAM) was not correctly selected.
+
+**Real gap in the logic**: our whole/parts area-sum matching has no way
+to distinguish "two genuine halves of one physical object" (like the
+two-tone capsule case it was designed for) from "two small, high-
+contrast surface details (logo/imprint text) that coincidentally
+satisfy the same area-sum arithmetic." Both produce the same kind of
+numeric match; current code can't tell them apart. Needs real diagnosis
+(raw masks + confidences for this image) before attempting a fix - in
+progress, not yet resolved.
+
+**Diagnosis confirmed with real numbers**: all 7 raw masks for this
+image passed BOTH the confidence (>=0.6) and fill-ratio (<=0.97)
+filters, including Mask 0 (confidence 0.9498, area 296,534 - almost
+certainly the actual pill body, by far the largest, dominant candidate).
+With 7 candidates in play, `_find_whole_and_parts` searched all pairings
+and found: Mask 1 (3,512 px) + Mask 2 (3,148 px) = 6,660, compared
+against Mask 3 (6,689 px) - a ~0.4% difference, easily inside the 30%
+tolerance. This is a genuine coincidental arithmetic match among 3 tiny
+logo/text fragments, completely unrelated to the real pill - which was
+sitting right there as Mask 0, an obviously dominant, correct candidate
+that never got considered because the whole/parts search ran
+unconditionally regardless of whether an obviously-dominant single
+candidate already existed.
+
+**Real fix**: before attempting whole/parts matching at all, check
+whether one candidate is DOMINANT - i.e. dramatically larger than the
+combined area of all other candidates. If so, skip the whole/parts
+search entirely and use that dominant mask directly - it's almost
+certainly the complete object on its own, and searching among the small
+leftover fragments for coincidental area-sum matches only invites false
+positives like this one. Not yet implemented - see next entry.
+
+### Dominance threshold calibrated and fix verified against ALL 4 known cases
+
+Before implementing, calibrated what "dominant" should mean using real
+numbers from both the capsule case (where NEITHER half should trigger
+dominance) and the orange-oval failure (where the real pill SHOULD
+trigger it). A naive "just bigger than the rest" check falsely flagged
+one capsule half as dominant (147,517 > 139,640 - technically true, but
+wrong in spirit, since they're genuinely two equal-ish halves). Tested
+multiplier thresholds of 1.5x, 2.0x, 3.0x against both cases - all three
+correctly separate the two situations (capsule: neither mask reaches
+even 1.06x the other; orange oval: dominant mask is ~8.4x the rest).
+Chose **2.0x** for comfortable safety margin given the wide gap.
+
+Implemented `_find_dominant_mask()` in `src/pillrag/segment.py`, wired
+into `select_pill_mask()` to run AFTER confidence/fill-ratio filtering
+but BEFORE the whole/parts search. Added `dominance_multiplier` as a
+configurable parameter (default 2.0), new `method="dominant"` value.
+
+**Applying the hard-learned lesson from the earlier mistake**: tested
+the exact updated logic against ALL 4 known cases together in the same
+Colab session before touching the real module file's correctness claim
+again. First attempt showed a suspicious result (capsule case wrongly
+returning "dominant") - traced to STALE session variables from earlier
+work, not an actual logic bug; re-generated all 4 test cases completely
+fresh (re-running FastSAM inference from scratch) before re-testing.
+
+**Final verified result, all 4 correct:**
+
+| Case | Method | Result |
+|---|---|---|
+| Capsule | `merged_candidates` (0, 2) | Correct - complete capsule, band excluded |
+| Round tablet | `single` (0,) | Correct |
+| Consumer (fabric bg) | `single` (0,) | Correct |
+| Orange oval (critical failure) | `dominant` (0,) | **FIXED** - full pill body correctly selected, logo fragment no longer wins |
+
 ### Open / next steps
 
-- [ ] Check the real shape distribution across our 1,000 pill types
-      (round vs oval vs capsule vs other) to know how much of the
-      low-contrast problem Hough Circles alone can address
-- [ ] Investigate an ellipse-fitting classical technique for oval/
-      capsule-shaped low-contrast pills (Hough Circles only handles
-      round shapes)
-- [ ] Wire the Hough Circle (and eventual ellipse) fallback into
-      `segment.py` properly, triggered when `select_pill_mask()` returns
-      `none_valid` AND the pill's known shape (offline indexing only)
-      indicates which classical technique to try
-- [ ] Re-test the full pipeline (FastSAM primary + classical fallback)
+- [ ] Investigate an ellipse-fitting classical technique for OVAL-shaped
+      low-contrast pills (Hough Circles only handles ROUND)
+- [ ] Wire the Hough Circle (and ellipse) fallback into `segment.py`
+      properly, triggered when `select_pill_mask()` returns `none_valid`
+      AND the pill's known shape (offline indexing only) indicates
+      which classical technique to try
+- [ ] Explicitly handle/log the CAPSULE and rare-shape cases that fall
+      through both fallbacks - flag for manual review rather than
+      silently producing a wrong mask
+- [ ] **CAPSULE is NOT being abandoned as out-of-scope** (unlike the
+      rare long-tail shapes) - user explicitly decided to come back and
+      build a real fallback for capsules too, after the ROUND/OVAL work
+      is done. Plan: run FastSAM across all CAPSULE-shaped pills in the
+      dataset specifically (same disciplined approach as the ROUND wide-
+      sample test - find real failures, understand them, THEN build a
+      fix), rather than leaving capsules permanently unhandled.
+- [ ] Re-test the full pipeline (FastSAM primary + classical fallbacks)
       against the same 3 `none_valid` wide-sample cases, plus a fresh
       wider sample, before batch-processing all 5,728 images
 - [ ] Revisit MEDISEG dataset for validating segmentation quality against
