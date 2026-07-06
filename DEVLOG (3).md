@@ -360,6 +360,43 @@ speed (one-time batch job, not live inference), correctness matters more
 here, and switching to -s later is a one-line change if -x proves too
 slow on Colab's free-tier GPU.
 
+### Testing across pill types - confidence threshold pattern found
+
+Tested FastSAM on 2 more real samples for contrast against the two-tone
+capsule case:
+
+**Single-color round tablet** (`ref` sample, `63304-0579-01...`):
+- **1 object detected**, confidence 0.8796, area 620,460 px
+- Visualized: clean, correctly-bounded circular mask, no artifacts
+- Supports the theory that the capsule's 4-object split was caused by
+  its two-tone coloring specifically, not a general FastSAM problem
+
+**Consumer photo on messy fabric background** (`dc_224/4274.jpg`,
+`00555-9016-58...`):
+- **2 objects detected**
+- Mask 0: clean, correct circular pill outline, confidence **0.9630**
+- Mask 1: nearly the ENTIRE image (1,016,000 / 1,048,576 px) - FastSAM
+  treating the whole frame as one catch-all region - confidence only
+  **0.4816**
+- Notably, postprocessing time dropped to 32.6ms here vs. >1000ms in
+  both earlier tests - postprocessing time appears to scale with
+  internal mask complexity, not a fixed per-image cost (worth
+  remembering when estimating full batch runtime)
+
+**Pattern confirmed across all 3 real tests so far**: the genuine pill
+mask is consistently HIGH confidence (0.88-0.96); artifact/catch-all
+masks (image-wide blob, horizontal band) are consistently LOW confidence
+(0.29-0.48). The one complication: the two-tone capsule produces TWO
+separate high-confidence masks (both need to be kept and merged), not
+just one.
+
+**Proposed selection rule** (not yet implemented/tested at scale):
+1. Filter out any mask below a confidence threshold (candidate: ~0.6-0.7,
+   comfortably separates real detections from artifacts in all 3 tests)
+2. Merge all remaining masks together (union) into one final pill mask -
+   handles both the "one clean mask" case and the "split into
+   same-object parts" case without needing to distinguish them
+
 ### Colab environment setup (done)
 
 - New Colab notebook, Runtime → Change runtime type → **T4 GPU** (free
@@ -415,6 +452,54 @@ shapes that may not split this way at all). Need to test against a
 wider variety of sample images before deciding a general rule such as
 "reject any mask touching all 4 image edges" + "reject low confidence" +
 "merge remaining masks."
+
+### Colab persistence problems (encountered and resolved)
+
+While retrying the FastSAM mask experiments on more sample images, hit a
+real, informative sequence of Colab-specific issues:
+
+1. **Session reload wiped everything** - uploaded files (`epillid_data.zip`,
+   later `pillbox_metadata.csv`) disappeared after a routine reload.
+   Confirmed this is expected Colab behavior: session disk is fully
+   ephemeral, separate from Google Drive.
+
+2. **Decision: mount Google Drive** for permanent file storage across
+   sessions, rather than re-uploading via `files.upload()` every time.
+   Files uploaded once to `MyDrive/pill-rag/data/raw/` (both
+   `epillid_data.zip` and `pillbox_metadata.csv`), confirmed present via
+   `!ls -la` (matches expected sizes: ~153MB, ~56MB).
+
+3. **Real bug this exposed in our own code**: `pillrag/data.py` had
+   hardcoded paths (`data/raw/epillid_data.zip` etc.), which broke the
+   moment we tried pointing at a different location (Drive's mounted
+   path). **Fixed properly** rather than patched around: paths are now
+   read from environment variables (`EPILLID_ZIP_PATH`,
+   `PILLBOX_METADATA_CSV_PATH` - added to `.env.example`), defaulting to
+   the original local project layout if unset. Locally, nothing changes
+   (no env vars set = same default behavior as before). In Colab, set
+   both env vars to the Drive-mounted path BEFORE importing
+   `pillrag.data` (env vars are read once, at import time - order
+   matters, confirmed by getting this wrong once mid-session).
+   Committed and pushed to GitHub so Colab's `pip install git+...` picks
+   up the fix.
+
+4. **Session RESTART (different from reload) wiped installed packages**
+   too, not just uploaded files/variables - had to `!pip install
+   ultralytics` and reinstall `pillrag` from GitHub again after
+   restarting to clear a `--force-reinstall` package-conflict warning.
+   Google Drive mount survived this restart without needing
+   re-authorization.
+
+**Practical lesson for future Colab sessions**: after ANY session
+reset (reload OR restart), expect to re-run, in order: (1) mount Drive,
+(2) reinstall packages (`ultralytics`, `pillrag` from GitHub), (3) set
+the `EPILLID_ZIP_PATH`/`PILLBOX_METADATA_CSV_PATH` env vars, (4) then
+import/use `pillrag`. Uploaded files in Drive and the repo on GitHub are
+the only things that reliably persist.
+
+**Verified fix works end-to-end**: `python -m pillrag.data`-equivalent
+call in Colab now returns the same numbers as locally - 5728 total rows,
+5544 with recovered text metadata.
 
 ### Open / next steps
 
