@@ -56,6 +56,13 @@ PILLBOX_TEXT_FIELDS = ["medicine_name", "spl_strength", "spl_ingredients"]
 # manufacturer originally submitted. Established rule (see DEVLOG.md
 # Phase 1): prefer pillbox_* when present (visually verified), fall back
 # to spl* otherwise.
+#
+# Color is needed for the same Phase 2 reason - specifically to properly
+# test the "low-contrast white-on-white/gray" failure mode by shape,
+# rather than assuming a small random sample is representative (see
+# DEVLOG.md - a 3-image spot check suggested OVAL might be robust to
+# this problem, but that's too small a sample to trust on its own).
+# Same pillbox_*-preferred, fallback-to-spl* rule applies.
 
 
 def _digits_only(s: str) -> str:
@@ -123,6 +130,9 @@ def load_pillbox_text_lookup() -> pd.DataFrame:
     # DEVLOG.md Phase 1 for why this specific fallback direction.
     df["shape"] = df["pillbox_shape_text"].fillna(df["splshape_text"])
 
+    # Same fallback rule for color.
+    df["color"] = df["pillbox_color_text"].fillna(df["splcolor_text"])
+
     return df.drop_duplicates("ndc_normalized").set_index("ndc_normalized")
 
 
@@ -141,7 +151,7 @@ def build_pill_dataset() -> pd.DataFrame:
     pillbox_lookup = load_pillbox_text_lookup()
 
     merged = epillid.merge(
-        pillbox_lookup[[*PILLBOX_TEXT_FIELDS, "shape"]],
+        pillbox_lookup[[*PILLBOX_TEXT_FIELDS, "shape", "color"]],
         how="left",
         left_on="ndc_normalized",
         right_index=True,
@@ -156,6 +166,7 @@ def build_pill_dataset() -> pd.DataFrame:
             "is_front",
             *PILLBOX_TEXT_FIELDS,
             "shape",
+            "color",
         ]
     ]
 

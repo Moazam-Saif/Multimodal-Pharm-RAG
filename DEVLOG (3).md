@@ -867,6 +867,71 @@ fresh (re-running FastSAM inference from scratch) before re-testing.
 | Consumer (fabric bg) | `single` (0,) | Correct |
 | Orange oval (critical failure) | `dominant` (0,) | **FIXED** - full pill body correctly selected, logo fragment no longer wins |
 
+### Consolidated Colab setup script created
+
+After repeatedly hitting the same reset friction (re-mounting Drive,
+reinstalling packages, re-setting env vars, re-importing everything,
+one cell at a time, every time a session disconnected or restarted),
+built `notebooks/colab_setup.py` - one consolidated script to paste as
+a SINGLE cell at the start of every Colab session, regardless of what
+kind of reset occurred. Ends by calling `build_pill_dataset()` and
+checking row counts against known-correct values (5728 total, 5544
+with text metadata) so a broken setup announces itself immediately
+rather than failing silently three cells later.
+
+Lives in `notebooks/`, not `scripts/` or `src/pillrag/` - it's Colab-
+session-specific glue code (uses `google.colab.drive`, only available
+in that environment), not portable pipeline logic or a local diagnostic.
+
+### Hit Colab's free-tier GPU usage quota
+
+After heavy GPU use this session (many individual FastSAM inference
+calls across capsule/round/consumer/oval testing, plus several full
+session resets each re-triggering GPU allocation), hit "Cannot connect
+to GPU backend... due to usage limits." Confirmed via Google's own
+Colab FAQ: free-tier GPU/compute limits are real, fluctuate, and
+Google deliberately does not publish a fixed reset time or wait
+estimate - no reliable way to know exactly when access returns.
+
+**Decision**: continue current investigation work (OVAL ellipse fitting,
+CAPSULE testing) via "Connect without GPU" - CPU-only FastSAM inference
+is slower but functionally fine for testing individual images one at a
+time, which is all we're doing right now. Treat GPU access as a scarce
+resource to deliberately conserve for the actual full 5,728-image batch
+run later, rather than spend it on incremental single-image testing.
+
+### OVAL low-contrast investigation - GOOD NEWS: FastSAM handles these correctly, no ellipse fitting needed (yet)
+
+Tested a fresh random sample of 20 OVAL reference images (seed 99) -
+zero `none_valid` failures (17 single, 3 dominant). Noted this alone
+wasn't conclusive proof (could just be an unlucky/lucky sample), so
+specifically identified the 3 palest/whitest-looking pills in the batch
+(`oval2_test_0`, `_1`, `_2` - genuinely comparable in tone to the round
+"TV" tablet failure case) and visually re-confirmed their masks directly.
+
+**Result: all 3 correctly segmented** - clean, complete oval outlines,
+correctly excluding the gray band background, despite low color
+contrast between pill and background.
+
+**Hypothesis for why OVAL (and likely CAPSULE) may be inherently more
+robust than ROUND to this problem**: an elongated oval/capsule silhouette
+is a distinctive SHAPE cue that a rectangular/square background region
+doesn't share, giving FastSAM's edge-based detection something to latch
+onto even when color contrast is weak. A perfect circle has no
+comparably distinctive silhouette against a rectangular frame - this
+may explain why round pills specifically struggled while ovals did not.
+Not proven, just a reasonable explanation consistent with what we've
+observed so far.
+
+**Practical implication**: ellipse-fitting fallback may not be urgently
+needed for OVAL specifically - the primary FastSAM + our verified
+`select_pill_mask()` pipeline already appears to handle low-contrast
+OVAL cases correctly. Re-prioritizing: focus next on the CAPSULE
+investigation (per user's explicit earlier decision not to skip it) to
+test whether this same robustness hypothesis holds there too, since
+CAPSULE has an even more elongated silhouette than OVAL and may be even
+LESS prone to the low-contrast problem than we originally worried.
+
 ### Open / next steps
 
 - [ ] Investigate an ellipse-fitting classical technique for OVAL-shaped
