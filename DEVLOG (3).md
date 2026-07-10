@@ -932,6 +932,148 @@ test whether this same robustness hypothesis holds there too, since
 CAPSULE has an even more elongated silhouette than OVAL and may be even
 LESS prone to the low-contrast problem than we originally worried.
 
+### User pushback: 3-image spot check isn't rigorous enough - added color field to test properly
+
+Good, warranted challenge: concluding "OVAL is fine" from 3 visually-
+selected pale images was too weak a claim - a small, non-systematic spot
+check, not a real test of how much of the OVAL population is actually
+white/pale (the true risk case). Decided to test this properly using
+actual color metadata rather than eyeballing images.
+
+**Extended `pillrag.data`** with a `color` field, same pattern as
+`shape` - added `pillbox_color_text`/`splcolor_text` fallback resolution
+in `load_pillbox_text_lookup()`, added `color` to `build_pill_dataset()`
+output. Pushed to GitHub.
+
+**Hit a real, separate bug while verifying the fix**: reinstalling in
+Colab via `pip install --upgrade --force-reinstall git+...` reported
+success and rebuilt a wheel, but the actually-loaded `pillrag.data`
+module still lacked the `color` column - confirmed by directly reading
+`inspect.getsource()` and the raw file content, not just trusting `pip`'s
+output. Verified the correct code WAS on GitHub (checked directly via
+browser) - ruled out a failed push. Root cause: pip's package cache can
+serve a stale build even with `--force-reinstall` in some cases. **Fix**:
+explicit `pip uninstall -y pillrag` followed by `pip install
+--no-cache-dir git+...` forced a genuinely fresh clone + build. Verified
+directly afterward (`"color" in file_content` check) before trusting it.
+
+**Lesson for future Colab work**: if a reinstall doesn't seem to pick up
+a real, confirmed-pushed code change, don't just retry the same install
+command - explicitly uninstall first and use `--no-cache-dir`.
+
+### Related issue: env vars set correctly but pillrag.data still used the default path
+
+Ran the full `colab_setup.py`-style cell fresh (no restart triggered
+this time). `build_pill_dataset()` still failed with `FileNotFoundError`
+on the LOCAL default path (`data/raw/epillid_data.zip`), not the Drive
+path. Diagnosed directly: `os.environ.get("EPILLID_ZIP_PATH")` correctly
+showed the Drive path, but `pillrag.data.EPILLID_ZIP` (the module-level
+variable actually used internally) still showed the old default -
+confirming our own code's documented risk (see `data.py`'s docstring):
+env vars are read ONCE, at import time. A leftover `pillrag.data` import
+from earlier debugging in the same browser session (before this
+"fresh" cell's `os.environ` lines ran) had already locked in the
+default path, and re-running the setup cell afterward doesn't undo
+that - only a genuine Python process restart does.
+
+**Fix**: Runtime -> Restart session (deliberately, via Colab's menu -
+not one triggered automatically by a pip reinstall this time), THEN
+re-run the entire setup cell as the very first thing in the fresh
+interpreter. **Lesson**: when debugging env-var-dependent import
+behavior interactively (e.g. checking `inspect.getsource()`,
+`importlib.reload()`), assume the session is now "contaminated" for
+this purpose and do a full restart before trusting a subsequent "clean"
+setup run.
+
+### Switched Google accounts to get fresh GPU quota - required sharing Drive access
+
+Original account's GPU quota was exhausted. Switched to a second Google
+account/Colab session to get GPU access back. This broke `drive.mount()`
+(`MessageError: credential propagation was unsuccessful`) since our
+Drive-based data files belong to the original account.
+
+**Fix**: shared the `pill-rag` Drive folder from the original account to
+the second account (Viewer access). Confirmed: shared folders mount
+under a DIFFERENT path pattern than owned folders -
+`/content/drive/.shortcut-targets-by-id/<folder-id>/pill-rag/...`,
+not the normal `MyDrive/pill-rag/...`. Found the real path via
+`!find /content/drive -iname "epillid_data.zip"` rather than guessing.
+Updated `EPILLID_ZIP_PATH`/`PILLBOX_METADATA_CSV_PATH` env vars to this
+shared-folder path for this account's sessions going forward.
+
+**Note for future sessions**: which exact Drive path to use now depends
+on WHICH Google account is running the notebook - the original account
+uses `MyDrive/pill-rag/...`, any other (shared-access) account uses the
+`.shortcut-targets-by-id/...` form. `notebooks/colab_setup.py` should be
+updated to note this, or made account-aware, rather than hardcoding one
+path - not yet done.
+
+### White-OVAL test done properly - 20 real samples from the actual 276-pill white-OVAL population
+
+Per user's push to verify with real data rather than a small visual
+spot check: found 276 real white-colored OVAL reference images (out of
+1,986 total OVAL rows), sampled 20 of them properly (random_state=42),
+ran the full pipeline with GPU re-enabled (faster than the earlier
+CPU-only testing).
+
+**Result: 17 single, 3 dominant, 0 none_valid** - genuinely clean
+across a properly-sized sample of the real risk population, not a
+lucky small spot check this time.
+
+**Important calibration, per user's follow-up observation**: visually
+confirmed all 20 of these white OVAL pills sit on the SAME gray
+background pattern seen throughout this dataset's OVAL reference
+photos - not a white/near-white background. This is NOT the same
+zero-contrast extreme as the round "TV" tablet failure (which was
+genuinely gray-on-gray, minimal contrast). **Accurate conclusion**: for
+THIS dataset's OVAL reference photography setup specifically (gray
+background, even for white pills), FastSAM handles the resulting
+contrast level correctly. This is a real, dataset-specific finding, not
+a general claim that "OVAL shapes are immune to zero-contrast
+segmentation problems" - we have not found (and this dataset's OVAL
+reference photos may not contain) a genuinely zero-contrast OVAL case
+to test the more extreme hypothesis against.
+
+### CAPSULE investigation - real, serious NEW failure pattern found (branding/text seam splitting)
+
+Checked CAPSULE color distribution first this time (lesson learned from
+OVAL): 861 total CAPSULE rows, WHITE most common single color (123,
+though "WHITE;X" combos add more), with a long tail of many other
+solid and dual-tone colors. Built a properly targeted sample: 15 real
+pure-WHITE capsule reference images (from 46 total available) + 1
+example each from 8 other distinct colors, for broader coverage per
+user's request.
+
+**Raw mask counts alone were a red flag before even checking
+correctness**: several images produced 8, 10, 11, 13, even 21 raw
+masks - dramatically more fragmented than round (1-4) or oval (1-6)
+pills typically showed. Method distribution: 10 whole_and_parts, 6
+merged_candidates, 6 dominant, 1 single, 0 none_valid.
+
+**Visually checked 7 examples spanning different methods/colors -
+found REAL, SERIOUS failures**, not just cosmetic imperfections:
+- `#0` (white, "PLIVA" branded): mask = only the LEFT HALF of the
+  capsule, cut off partway - WRONG, missing ~half the real pill
+- `#1` (white, "MACRO...25mg"): mask = a tiny arrow-shaped sliver,
+  almost no real pill area - WRONG
+- `#2` (white, "...240...mg"): same left-half-only failure as #0
+- `#15` (orange, "93 7338" branded): same left-half-only failure
+- `#20` (red, branded): tiny fragment, same pattern as #1
+- `#9` (white, "50mg/93 812"), `#12` (plain white, no visible imprint):
+  BOTH correct - complete, clean capsule shapes
+
+**Pattern identified**: capsules with printed text/branding that
+creates a visually strong "seam" or dividing line PARTWAY across the
+pill (off-center) are being split by FastSAM, and our current
+whole_and_parts / dominant / merged_candidates logic - all built and
+verified against the two-tone CAPSULE case and the orange-oval LOGO
+case - is failing to correctly recombine these fragments. The two
+correct examples both happen to have more centered/symmetric text, not
+creating an off-center dividing seam. This is a NEW, distinct failure
+mode from anything fixed so far - not yet diagnosed with real numbers
+or fixed. Next step: diagnose one clear failure case (e.g. #0 or #15)
+with real mask-by-mask data, same discipline as every previous fix.
+
 ### Open / next steps
 
 - [ ] Investigate an ellipse-fitting classical technique for OVAL-shaped
