@@ -585,21 +585,33 @@ def _is_suspiciously_small(
     final_area: int,
     all_masks: np.ndarray,
     min_fraction: float = DEFAULT_SUSPICIOUS_AREA_FRACTION,
+    max_fill_ratio: float = DEFAULT_MAX_FILL_RATIO,
 ) -> bool:
     """Check whether a resolved mask's area is suspiciously small
-    compared to the single largest mask across ALL raw masks
-    (regardless of confidence). The largest raw mask - even if low-
-    confidence - is a reasonable proxy for "how big the real pill
-    probably is." Verified in real testing (see DEVLOG.md "capsule
-    #20") to correctly flag a real failure while not flagging a
-    genuine correct result.
+    compared to the single largest PILL-SHAPED mask across ALL raw
+    masks (regardless of confidence). The largest genuinely pill-
+    shaped raw mask - even if low-confidence - is a reasonable proxy
+    for "how big the real pill probably is."
+
+    IMPORTANT: the reference mask must itself pass the fill-ratio
+    check (not be a band/blob artifact) - confirmed necessary in real
+    testing (see DEVLOG.md "capsule_0_WHITE regression"): comparing
+    against the literal largest mask, with no shape filtering, can
+    pick a BAND ARTIFACT as the reference (fill_ratio ~0.99), making a
+    legitimately correct, recoverable result look artificially small
+    and triggering an unnecessary, harmful retry. Excluding
+    artifact-shaped masks from the reference calculation fixes this.
     """
-    if len(all_masks) == 0:
+    pill_shaped_areas = [
+        int(m.sum()) for m in all_masks if bounding_box_fill_ratio(m) <= max_fill_ratio
+    ]
+    if not pill_shaped_areas:
+        return False  # no pill-shaped mask exists at all to compare against
+
+    largest_pill_shaped = max(pill_shaped_areas)
+    if largest_pill_shaped == 0:
         return False
-    largest_any = max(int(m.sum()) for m in all_masks)
-    if largest_any == 0:
-        return False
-    return final_area < largest_any * min_fraction
+    return final_area < largest_pill_shaped * min_fraction
 
 
 def resolve_pill_mask(
