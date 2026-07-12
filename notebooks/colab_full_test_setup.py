@@ -10,12 +10,15 @@ already-running Python process keeps whatever was loaded in memory
 before the install (see DEVLOG.md's confirmed root-cause finding: an
 official Colab GitHub issue explains Colab pre-loads numpy via
 matplotlib before our own install can matter). A restart is required
-between installing and using. This uses Colab's OFFICIAL programmatic
-restart API (`google.colab.runtime.restart()`, confirmed via
-googlecolab/colabtools#5204) rather than requiring you to click the
-"Restart session" dialog manually - but the restart itself unavoidably
-ends execution of the current cell, so cell 2 must be run separately,
-after the restart completes.
+between installing and using. There is NO official, documented
+google.colab API for a programmatic restart (a feature request for one,
+googlecolab/colabtools#5204, remains open/unresolved as of this
+writing - an earlier version of this file wrongly assumed it existed
+and shipped, causing an AttributeError; see DEVLOG.md). This uses the
+actually-working approach instead: killing the kernel process directly
+via `os.kill(os.getpid(), 9)`, which Colab automatically reconnects
+after. Either way, the restart unavoidably ends execution of the
+current cell, so cell 2 must be run separately, after reconnection.
 
 USAGE:
   1. Paste CELL 1 below, run it. It installs everything and restarts
@@ -54,10 +57,18 @@ get_ipython().system('pip install -q ultralytics')
 get_ipython().system('pip install -q --upgrade --force-reinstall git+https://github.com/Moazam-Saif/Multimodal-Pharm-RAG.git')
 
 print("Install complete. Restarting runtime now - this is expected, "
-      "just wait for it to reconnect, then run CELL 2 below.")
+      "the tab will show 'reconnecting' briefly. Once reconnected, "
+      "run CELL 2 below.")
 
-from google.colab import runtime
-runtime.restart()
+# NOTE: there is no official, documented google.colab API for this
+# (a feature request for one - googlecolab/colabtools#5204 - remains
+# open/unresolved, and an earlier version of this file wrongly assumed
+# it existed and shipped - see DEVLOG.md for that mistake). The
+# actually-working approach, confirmed across multiple real Colab
+# user reports, is to kill the kernel process directly - Colab
+# auto-reconnects to a fresh one afterward.
+import os
+os.kill(os.getpid(), 9)
 
 
 # ============================================================
