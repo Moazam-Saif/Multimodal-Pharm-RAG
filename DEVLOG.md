@@ -1069,10 +1069,461 @@ whole_and_parts / dominant / merged_candidates logic - all built and
 verified against the two-tone CAPSULE case and the orange-oval LOGO
 case - is failing to correctly recombine these fragments. The two
 correct examples both happen to have more centered/symmetric text, not
-creating an off-center dividing seam. This is a NEW, distinct failure
-mode from anything fixed so far - not yet diagnosed with real numbers
-or fixed. Next step: diagnose one clear failure case (e.g. #0 or #15)
-with real mask-by-mask data, same discipline as every previous fix.
+creating an off-center dividing seam.
+
+### Diagnosed with real data: FastSAM's raw output is inadequate, not a selection-logic bug
+
+Picked one clear failure (`capsule_combo_0`, a white capsule with a
+teal "PLIVA" band around its middle) and diagnosed with real per-mask
+numbers, same discipline as every previous fix:
+- 8 raw masks. Band artifact (area 337,907, fill_ratio 0.9938) and 4
+  low-confidence noise masks correctly excluded by our existing filters
+- The 3 remaining candidates (masks 0, 2, 3 - areas 45,194 / 71,795 /
+  2,954, summing to only ~120K px total) got unioned via
+  `merged_candidates`
+- Visualized all 3: Mask 0 = a thin vertical sliver (likely the teal
+  band's edge), Mask 2 = the correctly-shaped LEFT half of the capsule
+  only, Mask 3 = a tiny fragment. **The entire right half of the
+  capsule has no corresponding mask among ANY of the 8 raw detections
+  at all** - not a selection problem, FastSAM's own raw output never
+  produced a usable mask for that region in the first place.
+
+**Per user's request, tried adjusting FastSAM's own inference
+parameters** (not just our post-processing) before concluding this is
+unfixable:
+- `retina_masks=True` (generates full-resolution masks rather than the
+  default low-res-then-upscaled masks): changed absolute mask areas
+  dramatically (~20x smaller, consistent with a different underlying
+  mask resolution/coordinate space) but did NOT surface a right-half
+  mask - same wrong result, `dominant, indices: (2,)` (left half only)
+- `conf=0.4, iou=0.9` (standard example values from Ultralytics' own
+  docs, added on top of retina_masks): reduced raw masks from 8 to 4
+  (removed only the already-filtered-out low-confidence noise masks)
+  but again did NOT surface a right-half mask - same wrong result
+
+**Conclusion**: this is NOT a parameter-tuning-fixable problem. Tested
+resolution (retina_masks), detection threshold (conf), and merge
+threshold (iou) - none changed the fundamental fact that FastSAM never
+detects the plain white right-hand portion of this capsule as any kind
+of coherent object, confident or not. Real, likely root cause: once you
+exclude the colored band and textured left half, that plain white
+region is genuinely low-contrast against the gray background - this
+connects back to the SAME fundamental limitation already researched
+and documented for round pills (see earlier "low-contrast segmentation"
+entry), just triggered here by a different visual cause (a distracting
+colored band fragmenting attention) rather than uniform whiteness.
+
+**Not yet decided**: how to handle this. Options to consider next:
+classical-CV fallback specific to capsules (e.g. detect the pill's
+overall bounding shape via a different method when our confident masks'
+combined area is suspiciously small relative to typical capsule size),
+or accept as a documented, deferred limitation like the rare shapes
+from Phase 1/2 scope decisions, or investigate how common this
+specific "banded/off-center-text capsule" pattern actually is before
+deciding how much effort it deserves.
+
+### Corrected geometric understanding + found the missing mask was there all along, just low-confidence
+
+User caught an important error in the earlier diagnosis: measured the
+actual pixel geometry of `capsule_combo_0` directly (image is 224x224;
+left section ~15-65px, band ~65-115px, right section ~115-208px) -
+confirmed the two sections are NOT roughly equal halves as assumed.
+The right section is genuinely almost 2x wider than the left - "like a
+narrower tube fitted into a wider one." Re-verified Mask 2 really is
+the correctly-shaped LEFT (narrower) section, not mislabeled.
+
+**Then checked the 4 previously-filtered-out low-confidence masks
+directly (not just their confidence numbers) - found Mask 5 (conf=0.34)
+IS a complete, correctly-shaped, right-end-rounded mask covering
+exactly the missing right section.** This is a fundamentally different
+situation than "FastSAM never found it" - FastSAM DID find the correct
+shape, it just scored its own confidence very low.
+
+**Researched why a correct detection would score low confidence**:
+YOLOv8-seg's (FastSAM's backbone) confidence score is a PRODUCT of
+objectness (is there an object here?) and class confidence (what
+class?). FastSAM has only ONE class ("object"), so class confidence
+should be roughly constant - objectness is likely what's suppressing
+this score. Plausible explanation (not proven): a plain, texture-free,
+geometrically simple white region may look less "object-like" to a
+general-purpose segmenter than the more visually distinctive
+textured/colored/branded left section and band - genuinely
+counter-intuitive, since the "boring" correct answer scores lower than
+the "interesting" but only-half-right alternatives.
+
+**Tested user's grayscale-input idea** (remove color entirely, so the
+band isn't a distinct "color region" anymore): converted to grayscale
+before running FastSAM. Result: mask COUNT changed (8 -> 5) but the
+STRUCTURE was identical - band artifact still highest confidence
+(0.94), left section still separate (0.67), right section still found
+correctly but now at EVEN LOWER confidence (0.26, vs 0.34 in color).
+**Genuinely useful negative result**: grayscale didn't help, and
+actually made the target mask's confidence worse - rules out "it's a
+color-based problem," supports the theory that plain/uniform regions
+just inherently score lower regardless of color information.
+
+**Decided next step (per user)**: since the correct mask reliably
+EXISTS, just at low confidence, build a targeted fallback: when
+confident-masks-only produce a suspiciously small combined area for a
+CAPSULE (relative to typical capsule size), check the LOWER-confidence
+masks specifically for one that's geometrically complementary (fills
+the missing area/shape) - rather than broadly lowering the confidence
+threshold for everyone, which would reintroduce noise. Not yet
+implemented.
+
+### Built and tested the rescue + gap-closing fix
+
+Built `rescue_complementary_mask()`: checks rejected low-confidence
+masks for one that's genuinely pill-shaped (fill ratio 0.5-0.97) AND
+largely NEW area (<=15% overlap with current result) - if found, merge
+it in. Tested directly against `capsule_combo_0` ("PLIVA" band capsule):
+correctly rescued the missing right section (area 116,728 -> 263,964).
+
+**Found a new issue while inspecting the result visually (user caught
+this)**: a thin gap remained where the two merged pieces met (measured
+directly: 81px wide, ~9.3% of total pill area - NOT a trivial cosmetic
+issue). Root cause: the real physical band region (excluded earlier as
+an artifact) sits between the two merged pieces and was never covered
+by either. Built `close_internal_gaps()`: measures the mask's own
+largest internal gap directly (scans multiple rows through the
+vertical center, robust to an unlucky single-row measurement), sizes a
+`binary_closing` brush to that MEASURED width x 1.5 safety margin -
+not a fixed guess. First attempt with an arbitrary 25px brush failed
+to close the real 81px gap (proven: brush must be >= gap width to
+bridge it); the adaptive, measured version succeeded.
+
+**Tested the full pipeline (select -> rescue -> close) against all 5
+known capsule failures** (#0 PLIVA, #1 MACRO, #2, #15 orange, #20 red).
+**Result: 3/5 fixed cleanly (#0, #2, and #1 mostly - some rough edges),
+but 2/5 (#15, #20) still failed**, producing small incomplete blocks.
+
+**Diagnosed #15 with real numbers** (16 raw masks - capsule has printed
+numbers on BOTH halves, unlike PLIVA's single band): masks 2 (153,491px)
+and 4 (143,051px) are almost certainly the real left/right halves,
+correctly detected, high confidence. But `whole_and_parts` matched
+masks (2, 3, 4) together instead - mask 3 (a tiny 1,907px fragment,
+almost certainly one printed digit) got treated as a genuine "missing
+part" via a coincidental area-sum match.
+
+**User's insight, tested directly and confirmed**: checked whether
+mask 3 was actually CONTAINED inside mask 2 (i.e. a sub-detail sitting
+ON the real pill piece, not a separate part). Result: **100% contained
+in mask 2, 0% in mask 4** - and mask 2 vs mask 4 (the real halves)
+barely overlap each other at all (~0.1%). Clean, unambiguous evidence:
+containment fraction reliably distinguishes "genuine separate part"
+from "sub-detail sitting on an existing part."
+
+**Built `_containment_fraction()` and `_exclude_contained_masks()`**:
+before the whole/parts search runs, exclude any candidate that's >=90%
+contained inside another candidate - removes printed text/digit
+fragments from consideration as "parts" without needing to know
+anything about what they actually are.
+
+### Rewrote segment.py with the full fix, added resolve_pill_mask() as the real entry point
+
+Consolidated everything into an updated `src/pillrag/segment.py`:
+containment filtering wired into `select_pill_mask()` (runs after
+dominance check, before whole/parts search, with a safe fallback if
+too few candidates remain after exclusion), plus the new
+`rescue_complementary_mask()` and `close_internal_gaps()` functions,
+combined into a new top-level `resolve_pill_mask()` - the function
+calling code should actually use end-to-end going forward (the
+individual pieces stay exposed for testing/debugging).
+
+### Dependency incident: scipy/numpy version conflict broke the import entirely
+
+Added `scipy` (needed for `binary_closing`) to `pyproject.toml` with
+only a lower bound (`scipy>=1.11`), same pattern as our other deps.
+Reinstalling in Colab caused a hard `ImportError: cannot import name
+'_center' from 'numpy._core.umath'` - a genuine, confirmed-common
+scipy/numpy version incompatibility (found other people hitting the
+identical error in an unrelated project's GitHub issue - not something
+specific to us). Root cause: our unconstrained `numpy>=1.26` allowed
+pip to install numpy 2.5.1, but the scipy version that came with it
+expects an older numpy internal structure.
+
+**Fix**: used REAL evidence already sitting in earlier pip output,
+rather than guessing a version bound - Colab's own pre-installed
+`numba` had already told us via a dependency-conflict warning that it
+requires `numpy<2.1,>=1.22`. Pinned our own `numpy` to match
+(`>=1.26,<2.1`) and added a matching upper bound to `scipy`
+(`>=1.11,<1.14`) to keep them in a known-compatible range together,
+rather than let pip pick whatever the newest available versions are.
+
+**Lesson**: unconstrained lower-bound-only dependencies
+(`package>=X`) are risky in an environment (like Colab) that already
+has other packages with their OWN real constraints - check for
+existing dependency-conflict warnings in pip's output before assuming
+they're safe to ignore, they can contain the actual answer needed to
+pick a working version range.
+
+### numpy<2.1 pin broke LOCAL Windows install - no compiler available
+
+The `numpy>=1.26,<2.1` pin (chosen to fix the Colab scipy conflict)
+caused `pip install -e .` to FAIL locally on Windows: no prebuilt wheel
+available for that exact version range on this Python/Windows
+combination, so pip tried to build numpy 2.0.2 from source via Meson -
+which requires a C/C++ compiler (Visual Studio Build Tools or similar)
+not installed on this machine. Real, different failure mode than the
+Colab issue - same dependency, two different environments, two
+different constraints.
+
+**Decision**: loosen numpy back to `>=1.26` (no upper bound) rather
+than install a full compiler toolchain just to satisfy one narrow pin.
+Accepts the risk of hitting the Colab numpy/scipy conflict again in a
+future session - considered acceptable since we now know exactly how
+to diagnose (check pip's own dependency-conflict warnings for a real,
+evidence-based version bound) and fix it if it recurs. `scipy>=1.11,
+<1.14` pin kept as-is since it wasn't the source of either failure.
+
+### FOUND THE REAL ROOT CAUSE: this was never a version-pinning problem
+
+After several rounds of trying different numpy/scipy version pins in
+`pyproject.toml` (all failed with the same `ImportError: cannot import
+name '_center'`), stepped back and searched for the exact error
+directly rather than keep guessing pins. Found the real, definitive
+answer from an official Google Colab engineer on a GitHub issue
+(googlecolab/colabtools#5205) describing the EXACT same symptom.
+
+**Real root cause**: Colab pre-loads a numpy version into the kernel
+automatically as soon as something imports `matplotlib` (numpy is a
+transitive dependency of matplotlib, loaded early to support Colab's
+built-in variable inspector/quickchart features) - BEFORE our own
+`pip install` of a different numpy/scipy version ever gets a chance to
+matter. Installing a different version afterward does NOT replace what
+Python already has loaded in memory for the current session. This
+explains every confusing result we saw: version pins in `pyproject.toml`
+were irrelevant to the actual failure, because the wrong numpy was
+already loaded before our install even ran, in whatever cell order we
+happened to use.
+
+**Confirmed fix, straight from Colab's own team**: restart the runtime
+AFTER installing, then run everything fresh - the freshly-restarted
+kernel loads whatever version was actually installed, instead of
+whatever Colab pre-loaded. This is NOT a `pyproject.toml` pinning
+problem at all.
+
+**Reverted the unnecessary version-pin churn**: back to simple
+`numpy>=1.26`, `scipy>=1.11` (no upper bounds) - the pins never fixed
+anything, they were solving the wrong problem. The REAL fix is
+procedural: always do `pip install ...` followed by an explicit
+Runtime restart, then re-run setup fresh, whenever installing/changing
+numpy-dependent packages in Colab. Updating `notebooks/colab_setup.py`
+to note this explicitly.
+
+**Lesson**: when a fix genuinely isn't working after 2-3 reasonable
+attempts, stop iterating on the current approach and search for the
+EXACT error message directly - there was a definitive, official answer
+sitting in a GitHub issue the whole time, and several rounds of pin-
+guessing could have been avoided by searching first.
+
+### NEW real capsule failure found (capsule #20) - a deeper structural gap than PLIVA/93-7338
+
+While testing at a custom low confidence threshold (0.3), user noticed
+the final mask looked wrong (only ~half a capsule) - and importantly,
+pushed back correctly when initial diagnosis focused on the threshold
+itself: **the same wrong final mask occurred at the DEFAULT threshold
+(0.6) too**, just via different specific candidate masks. This
+redirected the investigation to trace what the code actually does,
+rather than reason about why threshold might matter.
+
+**Traced directly**: at threshold 0.6, `select_pill_mask` returned
+`whole_and_parts` using masks (0, 2, 5) - areas 5,780 / 3,284 / 2,495.
+ALL tiny fragments (likely printed digits/letters), nowhere near the
+real pill's size. Checked containment between all three pairs: 0%
+across the board - none of our existing fixes (fill-ratio, dominance,
+containment) apply, since none of these fragments sit inside each
+other or inside anything larger.
+
+**Root cause, confirmed by checking the full candidate list**: at
+threshold 0.6, ALL 7 surviving candidates (indices 0,2,3,4,5,6,7) are
+small fragments (2,454-5,780 px). **The two genuine pill halves (mask
+10: 143,640px, mask 12: 150,602px) are BOTH below the 0.6 confidence
+threshold** (0.4548, 0.3973) - same "correct detection, inexplicably
+low confidence" pattern as the PLIVA case, but here BOTH halves are
+affected, not just one. This means the confident candidate pool
+contains NO genuine pill-sized mask at all - whole/parts search has
+nothing correct to find, only coincidental noise to match against.
+
+**Why existing fixes don't cover this**: `rescue_complementary_mask()`
+only looks for a low-confidence mask that COMPLETES an already-
+mostly-correct result - it has no mechanism to recognize that the
+initial result itself is fundamentally wrong (built from nothing but
+noise), since it only checks masks not yet used, expecting the
+existing result to be a reasonable starting point.
+
+### Designed and tested a suspicious-result detection rule
+
+Idea: compare the confidence-filtered result's area against the
+single LARGEST raw mask across ALL masks, regardless of confidence
+(even a low-confidence big detection is a reasonable proxy for "how
+big the real pill probably is"). If the confident-only result is
+under some fraction (tested: 50%) of that largest-any-mask area, flag
+it as untrustworthy.
+
+**Tested against both known cases**:
+- Capsule #20 (known failure): final area 5,780 vs largest-any-mask
+  322,038 (the band artifact, coincidentally pill-sized) -> correctly
+  flagged suspicious (True)
+- Round tablet (known-good): final area 620,460 EQUALS largest-any-
+  mask 620,460 (was already the single correct dominant mask) ->
+  correctly NOT flagged (False)
+
+Rule correctly distinguishes both cases.
+
+### Retry logic tested - exposed a DEEPER bug: whole/parts arithmetic can match two genuinely real, separate objects
+
+Tested a naive retry (full pipeline at threshold 0.3) against capsule
+#20. Result STILL wrong, but instructively so: `whole_and_parts` chose
+whole=12, parts=(10,13) - and critically, **Mask 10 (143,640px) is
+ITSELF one of the two genuine, correctly-shaped pill halves**, not
+noise - it just got wrongly relegated to "part" status because its
+area, combined with a small fragment (mask 13, 16,864px), happened to
+sum close to Mask 12's area (150,602px, the OTHER genuine half).
+
+**User correctly diagnosed the real structural flaw**: the whole/parts
+search tries every combination blindly, with no concept of whether a
+proposed pairing makes physical sense - it will happily combine one
+large, well-formed piece with an unrelated tiny fragment as "parts" if
+the arithmetic coincidentally works, even when a better interpretation
+(two independent, complete objects) was staring right at it.
+
+**Checked whether a better match existed but was overlooked**: printed
+every valid whole/parts match found (not just the best one) - only 2
+existed (with just 3 candidates in the pool: 10, 12, 13, only 2
+combinations are mathematically possible at all). BOTH matches paired
+one real half with the fragment against the OTHER real half as "whole" -
+there was no better option available; the search's fundamental
+design (always try to find A whole/parts story) doesn't allow for "none
+of these pairings actually make sense."
+
+**Root fix designed and tested (user's framing)**: rather than reject
+based on absolute part-size similarity, reject any whole/parts match
+where a "part" is IMPLAUSIBLY large relative to its proposed "whole" -
+a genuine part should be meaningfully smaller than the whole it
+belongs to. Added `DEFAULT_MAX_PART_TO_WHOLE_RATIO = 0.85`: a part
+exceeding 85% of its whole's area is rejected as implausible.
+
+**Verified against 3 cases**:
+- Capsule #20's Match 1 (whole=12, parts=10+13): larger part/whole =
+  0.954 -> correctly REJECTED
+- Capsule #20's Match 2 (whole=10, parts=12+13): larger part/whole =
+  1.048 (mathematically the "part" is BIGGER than its "whole" - a
+  logical impossibility pure area-sum arithmetic can't catch alone) ->
+  correctly REJECTED
+- Genuine original two-tone capsule (whole=1, parts=0+2): larger
+  part/whole = 0.441 -> correctly ACCEPTED (well under the 0.85 cutoff)
+
+With both spurious matches now rejected, capsule #20 correctly falls
+through to `merged_candidates`, unioning masks 10+12+13 together.
+**Visually confirmed: complete, correctly-shaped capsule, area
+310,323** (vs the original broken result of 5,780) - both real halves
+present, small fragment (13) included but not meaningfully distorting
+the shape.
+
+**Implemented in `src/pillrag/segment.py`**: added
+`DEFAULT_MAX_PART_TO_WHOLE_RATIO` constant, updated `_find_whole_and_
+parts()` to reject any candidate match where either part exceeds this
+ratio relative to its proposed whole, before considering it as a
+best-match candidate.
+
+**Not yet done**: the suspicious-area-detection + retry-at-lower-
+threshold wrapper (`resolve_with_suspicious_retry`-style function,
+tested informally in-notebook) still needs to be properly built into
+`segment.py`/`resolve_pill_mask()` as real code, and re-verified
+against ALL known test cases (not just capsule #20) before trusting it
+- following this project's hard-learned rule about re-testing broadly,
+not just against the one case a fix was built for.
+
+### Built resolve_pill_mask() with the suspicious-retry wrapper, ran full 9-case regression test
+
+Implemented `_is_suspiciously_small()` and wired the retry logic into
+`resolve_pill_mask()` for real (select -> retry-if-suspicious -> rescue
+-> close). Pushed and ran the FULL battery of all 9 known test cases
+from this entire session (per this project's rule: re-verify broadly,
+not just the case a fix targeted).
+
+**Result: most cases correct** (round, consumer, capsule_2, capsule_15,
+capsule_20, orange_oval_logo all showed clean, correct complete pill
+shapes). **But 2 real regressions found**: `capsule_bandtest` (PLIVA)
+now showed a blocky rectangle instead of its previously-correct
+capsule shape, and `capsule_1_WHITE` (MACRO) showed jagged, incomplete
+edges.
+
+**Diagnosed PLIVA regression precisely**: traced step by step
+(select_pill_mask alone -> rescue -> close) and found EACH individual
+step gave the correct result in isolation. But `resolve_pill_mask()`
+called directly gave a suspicious/retried/wrong result. Investigated
+via `_is_suspiciously_small()` directly: **base result (116,728,
+correctly recoverable via rescue) was being compared against the
+BAND ARTIFACT's inflated area (337,907, fill_ratio 0.9938) as the
+"largest mask" reference** - making a legitimately correct, rescuable
+result look artificially tiny (116,728 / 337,907 = 34%, under our 50%
+cutoff) and triggering an unnecessary, harmful retry that then
+produced a worse result than the original.
+
+**Real fix**: `_is_suspiciously_small()` now excludes non-pill-shaped
+(band/blob artifact) masks from its own "largest mask" reference
+calculation, using the same fill-ratio check trusted everywhere else
+in this module - comparing only against genuinely pill-shaped
+candidates, never against an artifact's inflated size.
+
+### MISTAKE: cited an unverified/fictional Colab API, caught by user
+
+While building a two-cell Colab setup script (to solve the "run one
+command, auto-restart, continue" request), cited
+`google.colab.runtime.restart()` as if it were confirmed, shipped,
+documented functionality - it is NOT. The only source was an OPEN,
+UNRESOLVED GitHub feature request (googlecolab/colabtools#5204) asking
+Google to build this; it doesn't exist yet. This produced a real
+`AttributeError` when run. **User correctly called this out**: "at
+least use documentation instead of making assumptions on your own."
+
+**Fix**: searched properly this time, confirmed via multiple
+independent real-world reports that the actually-working approach is
+`os.kill(os.getpid(), 9)` (or equivalently `get_ipython().kernel.
+do_shutdown(restart=True)`) - killing the kernel process directly,
+which Colab auto-reconnects after. Also confirmed: there is NO way to
+avoid the two-cell split regardless of method - a restart always ends
+execution of the current cell, no matter how it's triggered.
+
+**Lesson, worth stating plainly**: a GitHub issue TITLE or a feature
+request describing desired behavior is not confirmation that behavior
+exists or ships - must verify a claimed API actually exists (e.g. via
+real usage reports/documentation showing it working), not just that
+someone discussed wanting it.
+
+### FULL 9-CASE REGRESSION TEST PASSED - mask selection logic considered stable
+
+After fixing the `_is_suspiciously_small` reference-mask bug and the
+Colab restart mechanism, ran the complete battery of all 9 known test
+cases from this entire Phase 2 investigation through the real, pushed
+`resolve_pill_mask()`, using the new two-cell `colab_full_test_setup.py`
+script (built specifically to make this kind of full regression check
+fast and repeatable going forward):
+
+1. `capsule_bandtest` (PLIVA, band artifact) - correct
+2. `round_clean` (single confident mask) - correct
+3. `consumer_blob` (whole-image artifact) - correct
+4. `capsule_0_WHITE` (same as PLIVA, re-verified) - correct
+5. `capsule_1_WHITE` (MACRO, printed text) - correct (previously a
+   regression, now fixed)
+6. `capsule_2_WHITE` - correct
+7. `capsule_15_ORANGE` (93 7338, printed numbers both sides) - correct
+   (originally one of our 5 known capsule failures)
+8. `capsule_20_RED` (two genuine halves coincidentally matching
+   whole/parts arithmetic) - correct (the fix built earlier this session)
+9. `orange_oval_logo` (tiny logo fragment winning over the real pill) -
+   correct
+
+**All 9 cases now resolve correctly.** This closes out the current
+round of FastSAM mask-selection fixes with a real, complete, honest
+verification - not just the specific case each fix targeted. The
+`segment.py` module (confidence + fill-ratio filtering, dominance
+check, containment filtering, whole/parts matching with plausibility
+check, rescue of complementary low-confidence masks, suspicious-result
+retry, adaptive gap-closing) is now considered stable pending further
+testing at real batch scale.
 
 ### Open / next steps
 
@@ -1260,3 +1711,66 @@ a hard-to-detect quality issue, not a hard crash. Since we lack raw
 unrecoverable from pillbox_images.zip, see NDC join investigation above),
 we can't reprocess them consistently even if we wanted to. Fully deferred,
 not just for text.
+
+---
+
+## CURRENT STATUS (most recent - read this first for "where are we now")
+
+**Phase 1 (data)**: complete. 5,728 images, 1,000 pill types, 96.8%
+text metadata coverage, all via `pillrag.data.build_pill_dataset()`.
+
+**Phase 2 (segmentation)**: FastSAM mask-selection logic in
+`src/pillrag/segment.py` is considered STABLE - verified against a
+full battery of 9 real, distinct known-hard cases (see "FULL 9-CASE
+REGRESSION TEST PASSED" above), covering: two-tone capsules with band
+artifacts, clean single-color round tablets, consumer photos with
+whole-image blob artifacts, capsules with printed text/logos on one or
+both sides, and two genuinely separate real pill-halves that
+coincidentally satisfied whole/parts arithmetic with each other.
+
+**The real, current entry point is `resolve_pill_mask(confidences, masks)`**
+from `src/pillrag/segment.py` - NOT `select_pill_mask` alone (that's
+one internal stage of the full pipeline: select -> retry-if-suspicious
+-> rescue -> close-gaps).
+
+**For fast, repeatable testing/verification going forward**, use
+`notebooks/colab_full_test_setup.py` (two cells - CELL 1 installs +
+auto-restarts via `os.kill`, CELL 2 builds `model`, `df`, `ZIP_PATH`,
+and `TEST_CASES` - a dict of all 9 known test cases, pre-loaded and
+already run through FastSAM, ready to use immediately without
+re-extracting anything).
+
+**Known, explicitly deferred gaps** (not yet addressed, not silently
+ignored):
+- No classical-CV fallback yet for genuinely `none_valid` cases
+  (confirmed to occur for low-contrast ROUND pills specifically - the
+  "TV" tablet case). Hough Circle detection was designed and confirmed
+  working for this case, but not yet wired into `segment.py` itself.
+- OVAL was tested broadly (properly, with real color-distribution-based
+  sampling) and appears NOT to need a dedicated fallback in this
+  dataset's specific photography conditions - but this is a dataset-
+  specific finding, not a general guarantee.
+- CAPSULE mask-selection logic is now considered solid (9/9 verified),
+  but we have NOT yet run a wide, systematic sample across all 861
+  CAPSULE pills the way we did for ROUND - only a targeted, hand-picked
+  set of known-hard cases. User has explicitly said capsules are not to
+  be abandoned as out-of-scope - a genuine wide-sample CAPSULE test is
+  still owed before considering this phase fully done.
+- The rare long-tail shapes (triangle, diamond, square, etc., ~3.5% of
+  the dataset) remain genuinely out of scope, acknowledged.
+- No batch run across all 5,728 images has been attempted yet - only
+  individual and small-sample testing. Real batch-scale runtime,
+  Colab GPU-quota budgeting, and what/how much to persist (per Phase 1's
+  "don't persist full segmented set" decision) are all still open.
+- MEDISEG (raw multi-pill photos + real segmentation ground truth,
+  deferred from Phase 1) has not yet been revisited for validating
+  segmentation quality.
+
+**Next reasonable step**: either (a) a genuine wide CAPSULE sample test
+(matching the rigor already applied to ROUND/OVAL) before declaring
+Phase 2's mask-selection logic fully validated, or (b) begin planning
+the actual batch-processing run across all 5,728 images.
+
+
+
+
