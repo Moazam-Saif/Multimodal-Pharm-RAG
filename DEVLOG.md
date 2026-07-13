@@ -1824,6 +1824,377 @@ really landed on the user's machine.
 
 across all 5,728 images attempted yet; MEDISEG not yet revisited.
 
+### Wide ROUND sample test WITH Hough fallback (30 images, random_state=202) - Hough never triggered; found a NEW, distinct dominance-check failure instead
+
+Ran the fresh 30-image random ROUND sample specified in HANDOFF.md's
+step 2, this time with `image_path`/`known_shape="ROUND"` passed
+through so the Hough Circle fallback would be exercised if needed, per
+the still-open verification item from the previous session. Also
+added, beyond HANDOFF's literal step-2 wording, a visual spot-check
+grid covering not just flagged (`none_valid`/`hough_circle_fallback`)
+cases but a control sample of normal successes too - the same
+"don't trust the method label alone" rule applied more broadly.
+
+**Result: 0/30 hit `none_valid`, 0/30 hit `hough_circle_fallback`.**
+Methods returned: `single` (19), `dominant+closed` (4), `single+closed`
+(4), `dominant` (3). This sample happened not to contain the
+low-contrast failure mode the fallback exists for - not yet evidence
+either way on whether the fallback logic itself is wired correctly,
+just that this particular 30-image draw didn't need it.
+
+**But the control-sample spot-check (5 normal-success images, chosen
+independently of the Hough question) caught a real, separate bug**:
+idx=9 (pilltype `00093-7305-65_7C2F3E59`, WHITE, method=`dominant`)
+resolved to a mask that is NOT the pill - it's a sparse, jagged,
+disconnected artifact tracing the image's border and corners, with the
+actual pill only incidentally clipped inside part of it. This would
+have been silently accepted as a correct result if the control-sample
+check hadn't been added, since `dominant` was already an established,
+previously-validated method label.
+
+**Diagnosed with real numbers** (not guessed) by re-running FastSAM on
+the exact same image and printing every raw mask's confidence, pixel
+area, and bbox fill ratio:
+
+| mask | confidence | area_px | bbox_fill_ratio |
+|---|---|---|---|
+| 0 (artifact) | 0.8296 | 771,491 | 0.8166 |
+| 1 (real pill) | 0.6512 | 13,600 | 0.8509 |
+| 2 (rejected, low conf) | 0.2766 | 21,018 | 0.9041 |
+
+Mask 0 (the artifact) passes BOTH the confidence filter (0.83 >= 0.6)
+and the fill-ratio filter (0.8166 <= 0.97 max), then legitimately wins
+the dominance check against mask 1 by sheer area (771,491 vs 13,600 =
+56.7x, threshold is 2.0x) - so `_find_dominant_mask` picks it
+correctly *given its inputs*, but its inputs are wrong.
+
+**Root cause**: `bounding_box_fill_ratio`'s underlying assumption -
+"rectangular artifacts have HIGH fill ratio, genuine pill shapes have
+LOWER fill ratio because of empty bbox corners" - does not hold for
+THIS artifact shape. This artifact is not rectangular at all; it's a
+thin, sprawling, disconnected trace along the image border/corners
+that happens to still fill ~82% of its own (nearly full-image) bounding
+box, comfortably under the 0.97 cutoff. This is a third, previously
+undocumented artifact failure mode, distinct from both the band
+artifact and the whole-image "blob" artifact already on record - none
+of the previously-designed filters (fill-ratio, dominance, containment,
+whole/parts plausibility) were built with this shape in mind, and none
+of them catch it.
+
+**Not yet fixed.** Per the user's explicit direction: investigate a
+distinguishing property of this specific artifact shape (candidates to
+check: low solidity/convexity relative to its convex hull, number of
+disconnected components, whether it touches the image border) before
+designing a new filter - do not guess-and-check blindly, verify
+against this real case and re-test broadly before trusting any fix.
+
+**Scope note**: this bug is independent of the Hough Circle fallback
+question and does not block or get blocked by it - it's a gap in
+`select_pill_mask`'s existing dominance logic, present since before the
+Hough work started. The Hough-fallback verification itself
+(does it correctly trigger and produce a correct circle for a genuine
+`none_valid` low-contrast case) remains separately open, since this
+sample never exercised it.
+
+### Investigated two candidate fixes for the idx=9 dominance-check bug - both tested with real data, both rejected
+
+Before touching `segment.py`, tested two candidate distinguishing
+properties against real data rather than guessing which would work.
+
+**Candidate 1: largest-connected-component-only filtering** (drop small
+disconnected specks, keep only a mask's biggest connected piece).
+Tested against idx=9's actual masks: the artifact mask (mask 0) only
+lost 2.9% of its area (771,491 -> 749,406px) after this filter - it
+turns out the artifact is NOT fragmented into many small disconnected
+pieces as initially assumed from the raw connected-component count (9
+components); it's overwhelmingly ONE large connected shape (a
+continuous border/corner-hugging trace) plus a few tiny unrelated
+specks. Confirmed safe on 4 sanity-check images from the "false alarm"
+batch below (all showed <2% area change) but doesn't come close to
+fixing the actual bug. **Rejected: doesn't address the real shape of
+this artifact.**
+
+**Also discovered while investigating candidate 1**: the original
+suspicion, that 19/30 fresh ROUND images (random_state=909) had a
+similarly-shaped mask-0 artifact based on connected-component-count and
+solidity metrics, was WRONG upon visual inspection. All 19 flagged
+candidates were visually confirmed to be genuine, correctly-shaped pill
+masks with only a few tiny disconnected noise specks near the edges/
+corners - not large artifacts. idx=9 (from the earlier random_state=202
+sample) is NOT representative of a common pattern; it appears to be a
+comparatively rare failure. Caught by visualizing before concluding,
+per the project's own repeated rule - the numeric-only "suspect" filter
+in the previous session's script was a false alarm generator, not a
+real finding.
+
+**Candidate 2: circularity as a FINAL-RESULT gate** (mask area /
+minimum-enclosing-circle area, computed on `resolve_pill_mask()`'s
+actual final_mask - analogous to how `_is_suspiciously_small` already
+gates final results, not raw candidates). Explicitly checked the
+disjoint-semicircle edge case first (per user's concern): confirmed
+individual halves of a real pill mask score much lower circularity than
+the whole (0.38-0.40 vs 0.7382), while the union correctly recovers the
+whole's score - so this metric is only valid when applied to a fully
+assembled candidate, never to raw per-component pieces. Applied that
+way, tested across the fresh 30-image ROUND sample (random_state=909)
+plus idx=9 as a positive control:
+
+- idx=9 (known artifact): circularity = 0.5388
+- The 30 "presumed-correct" fresh results: circularity ranged 0.4961
+  to 0.9927, mean 0.7735, with **8 of the 30 scoring at or below
+  idx=9's score** (0.4961-0.5550) - heavy overlap between the known-bad
+  case and the presumed-good population, no clean separating threshold
+  exists.
+
+Did not have time to visually confirm whether those 8 low-circularity
+"presumed-correct" cases are genuinely correct (making circularity too
+noisy a signal to use) or are themselves hidden instances of the same
+bug (making the true failure rate higher than currently known). **This
+is left as an explicitly open, unresolved question** - not concluded
+either way. **Rejected for now: no clean threshold found; would need
+either a different metric, a combined signal, or per-case visual
+confirmation of the 8 overlapping low-circularity cases before this
+approach could be trusted.**
+
+**Current status**: the idx=9 dominance-check bug remains UNFIXED.
+Two real candidate approaches ruled out with evidence; no third
+approach yet attempted. Whether this bug is rare (as the visual
+false-alarm-correction above suggests) or more common than currently
+known (as the unresolved circularity overlap suggests) is itself still
+an open question - the two investigations point in different
+directions and this has not been reconciled.
+
+### Re-confirmed Hough fallback baseline still works on the original "TV" tablet case
+
+Before searching for additional low-contrast ROUND failure cases to
+broaden Hough fallback validation, re-confirmed the ONE case it's ever
+been validated against still behaves correctly: `TEST_CASES["round_
+clean"]` (the "TV" tablet, gray-on-gray). Confirmed both that the base
+pipeline alone (no `image_path`/`known_shape`) still genuinely returns
+`none_valid` on this case (hasn't silently started working via some
+other path), and that enabling the fallback produces a correct circle
+mask on the real pill, visually verified. No regressions. This is
+still only ONE validated case - broader validation (searching for more
+genuine low-contrast ROUND failures) is the immediate next step, not
+yet done.
+
+### Searched broadly for more genuine low-contrast ROUND failures - found none; concluding the Hough fallback is a rare-case safety net, not a common path
+
+Ran the base pipeline (no Hough) against a wide, fresh sample: 40
+WHITE-colored ROUND images (random_state=555, the hypothesized highest-
+risk group per the fallback's own original design rationale) plus a
+20-image other-color control group, specifically checking the genuine
+`none_valid` rate before any fallback is applied.
+
+**Result: 0/60 genuine `none_valid` failures** - every image resolved
+via the normal pipeline (`single`, `dominant`, `merged_candidates`,
+each ± `+closed`/`+rescued`). WHITE and other-color groups showed
+similar method distributions, no meaningful difference in failure
+rate between them.
+
+**Combined with the earlier random_state=202 sample (30 more ROUND
+images, also 0 genuine `none_valid`): 90 ROUND reference images tested
+across three independent random samples, zero genuine base-pipeline
+failures found.** The original "TV" tablet case (from `TEST_CASES`)
+remains the ONLY known real failure ever encountered.
+
+**Decision (explicit user call, not concluded unilaterally)**: did not
+dig into root-causing why the TV tablet case specifically failed
+(e.g. comparing its actual image properties against the 90 non-failing
+samples) - accepting, based on the 90/90 evidence, that genuine
+low-contrast FastSAM failures on ROUND pills are rare in this dataset,
+and the Hough Circle fallback should be understood as a rare-case
+safety net for the batch run (expected to trigger occasionally across
+5,728 images, not on any predictable subset), rather than something
+that needed a large validation sample to trust. The fallback's own
+correctness (does it draw an accurate circle WHEN it does trigger) is
+still confirmed via the re-verified TV tablet baseline above - what's
+now settled is only that it won't be exercised often.
+
+**Phase 2 status**: mask-selection logic + Hough fallback are now
+considered adequately validated for the purposes of proceeding to
+batch-run planning, WITH ONE EXPLICIT CARVE-OUT: the idx=9 dominance-
+check bug (border/corner-artifact winning the dominance check) remains
+open and unfixed. Whether to proceed to the batch run with this known
+bug still present, or fix it first, is a real decision for the user to
+make explicitly - not to be silently assumed either way.
+
+**Decision made**: proceed to batch-run planning now; accept the
+dominance-check bug as a known, unquantified risk for this run rather
+than fixing it first. Consequence for batch design: since we cannot
+currently detect this failure mode automatically (no working filter
+exists yet), the batch run's error-handling/QA plan must account for
+the possibility that some `dominant`-method results are silently wrong
+in a way the pipeline itself won't flag - this needs to inform the
+batch's QA/spot-check strategy, not just the `None`-handling behavior.
+
+### Batch-run planning: mask storage format decided
+
+Working through HANDOFF.md's open batch-run questions one at a time,
+per the user's explicit preference to decide these together rather
+than have them picked silently.
+
+**Deliverable/output format**: mask only, NOT a background-blanked
+image - reaffirms the project's existing Phase 1 decision not to
+persist a full segmented image set long-term (Colab<->Drive I/O for
+many small files is slow). Phase 3 will apply the mask to the original
+image in memory at embedding time, on demand, rather than a second
+image file ever being written to disk.
+
+**Mask encoding: RLE (run-length encoding)**, not raw full-resolution
+boolean arrays or contour/bounding-box approximations. Reasoning:
+pill masks are large, mostly-contiguous blobs, so RLE should compress
+far better than raw arrays; contour-only storage was rejected as too
+lossy given Phase 2's masks are frequently irregular (merged capsule
+halves, gap-closed seams, whole/parts unions) - directly relevant
+since so much of Phase 2's own work was specifically about handling
+non-convex, irregular real pill shapes.
+
+**Bundling: chunked manifests** (one combined file per ~500 images),
+not a single all-5,728 manifest and not one-file-per-image. Reasoning:
+a single monolithic manifest risks losing all progress on a mid-run
+crash unless carefully checkpointed; one-file-per-image reintroduces
+the slow many-small-files I/O problem already ruled out once for image
+persistence. Chunking gives most of the I/O benefit of bundling while
+providing natural resume points if the batch run crashes partway
+through.
+
+**Still open from HANDOFF's original batch-run question list**: GPU
+quota budgeting (time a smaller batch and extrapolate), error handling
+for genuine `None` results, and whether/how `known_shape` gets wired
+through per-image for the batch (real shape data is in `df["shape"]`,
+but scope-restricted to offline indexing only per `hough_circle_
+fallback`'s own docstring).
+
+### Batch-run planning: remaining three open questions decided
+
+**Error handling for genuine `None` results** (image fails the base
+pipeline AND Hough, if applicable): flag for review AND still attempt
+a fallback - use the WHOLE raw image as the mask (all-True, no
+background suppression) rather than skip the image entirely, so Phase
+3 always has something to embed on. Critically, this fallback must be
+marked distinctly in the manifest (e.g. a `quality_flag` or a method
+value like `"fallback_full_image"`) so it's never silently
+indistinguishable from a genuinely-segmented result - explicitly
+learned from the idx=9 near-miss earlier this session, where a
+plausible-looking result silently hid a real failure.
+
+**`known_shape` wiring: YES, wired through per-image from
+`df["shape"]`** for this batch run, enabling the Hough fallback where
+applicable. Explicitly confirmed as within `hough_circle_fallback`'s
+own documented scope restriction (offline indexing only, never live
+end-user queries) before deciding this.
+
+**GPU quota budgeting approach**: time a smaller batch (~100 images)
+first, extrapolate to the full 5,728, and report back before
+committing to the full run - not proceeding directly to a full run
+blind.
+
+**All four of HANDOFF's original open batch-run questions are now
+decided.** Next actual step: write and run the 100-image timing batch
+before writing the real batch script.
+
+### 100-image timing batch run - completed, plus two follow-up checks
+
+Ran a stratified ~100-image sample (proportional across all shapes:
+43 ROUND, 33 OVAL, 16 CAPSULE, remainder split across rare long-tail
+shapes) through the FULL real pipeline end-to-end (FastSAM inference +
+`resolve_pill_mask` with `known_shape` wired per-image from
+`df["shape"]`), timing each image, encoding the final mask as COCO-
+style RLE via `pycocotools.mask` (not a custom implementation - decided
+explicitly this session), and building an in-memory manifest matching
+the planned real format (one row per image: `full_image_path`,
+`pilltype_id`, `shape`, `method`, `quality_flag`, `rle_size`,
+`rle_counts`).
+
+**Timing result**: 100 images in 32.5s total. Mean 0.313s/image, median
+0.224s/image, min/max 0.183s/2.023s. **Extrapolated full-batch estimate:
+~1,790s (~30 minutes) for all 5,728 images** - comfortably within a
+single Colab session, no need to split across multiple sessions.
+
+**quality_flag distribution in this sample**: 99 `ok`, 1
+`fallback_full_image` (~1% hit the genuine-`None`-with-fallback path;
+extrapolated linearly, roughly ~57 images across the full dataset might
+need this fallback - a real, if small, additional source of quality
+degradation ON TOP OF the still-unquantified idx=9 dominance-check risk;
+these are two SEPARATE known risks, not the same issue).
+
+**method distribution**: `single` (58), `dominant` (14), `single+closed`
+(10), `merged_candidates+closed` (7), `merged_candidates` (5),
+`dominant+closed` (3), `whole_and_parts` (2), `fallback_full_image` (1).
+
+**Follow-up check 1: was the 2.023s max outlier a one-time warmup cost?**
+Re-ran 20 FRESH images and printed the full per-image time-series.
+**Answer: NOT purely warmup.** First image was slowest (0.592s in this
+re-run) but two OTHER images later in the sequence (0.501s at position
+2, 0.389s at position 11) were also notably slow, scattered mid-run -
+real per-image time variance exists, not just a first-call cost.
+Absolute worst case in this check (0.592s) was still well under the
+original run's 2.023s max, so the original outlier may be PARTLY
+warmup-related but the full explanation is unresolved and likely
+data-dependent variance rather than a single fixed cost. **Not further
+investigated - accepted as normal variance given the overall ~30min
+estimate has comfortable headroom regardless.**
+
+**Follow-up check 2: actual RLE-encoded manifest size.** Measured real
+JSON-serialized byte size per masked row (not just eyeballing string
+length): mean 3,219 bytes/row across a 15-image sample. Extrapolated:
+~1.57 MB for a single ~500-image manifest chunk, ~17.6 MB total across
+all ~12 chunks needed for the full 5,728-image dataset. Cross-checked
+against pandas' own `memory_usage(deep=True)` accounting as a sanity
+check (3,431 bytes/row - consistent, same order of magnitude).
+**Conclusion: storage size is trivially small, no concern at all.**
+
+**All timing/sizing questions now answered. Batch run is READY TO
+WRITE for real** (pending the still-open idx=9 dominance-check
+accepted-risk caveat, and the ~1% fallback-rate caveat above - both
+explicitly accepted risks, not blockers, per this session's decisions).
+
+## SESSION HANDOFF NOTE (context limit reached)
+
+This session ran out of context before writing the actual final batch
+script (the one that processes all 5,728 images for real and writes
+chunked manifest files to Drive). Everything needed to write it is now
+decided and documented above and in this session's DEVLOG.md entries:
+
+**What the real batch script still needs to do, not yet written:**
+1. Iterate over ALL 5,728 rows of `build_pill_dataset()`'s output (not
+   just `is_ref==True` - re-check whether the batch should cover
+   is_ref rows only or truly all rows; this specific question was
+   NOT explicitly re-confirmed this session, worth asking the user)
+2. For each image: extract from zip, run FastSAM, call
+   `resolve_pill_mask(confidences, masks, image_path=local_path,
+   known_shape=row["shape"])`
+3. On `final_mask is not None`: encode via `encode_rle()` (pycocotools,
+   as in the timing scripts), `quality_flag="ok"`, `method=result.method`
+4. On `final_mask is None`: fall back to `np.ones(mask_shape, dtype=bool)`,
+   `quality_flag="fallback_full_image"`, `method="fallback_full_image"`
+   - use the SAME fallback-shape-detection logic as `timing_test_100.py`
+     (mask shape from any raw mask if available, else `cv2.imread` the
+     image directly for its dimensions)
+5. Accumulate rows into a manifest DataFrame; **write out one manifest
+   chunk file per ~500 images** (not one giant file, not one-file-per-
+   image - chunking decision from this session) to
+   `data/samples/segmented_preview/` or a new `data/masks/` location
+   (EXACT output directory not yet decided - ask the user)
+6. Include basic progress logging (e.g. print every N images) since a
+   ~30min run benefits from visible progress in Colab
+7. Consider wrapping in a try/except per-image so ONE bad image
+   (corrupt file, unexpected zip entry, etc.) doesn't crash the entire
+   ~30-minute run - NOT yet decided/discussed with the user, worth
+   raising explicitly before writing the real script, per this
+   project's "ask, don't silently pick" rule
+
+**Everything else needed is already decided and documented** in this
+DEVLOG.md (mask format, chunking, fallback behavior, known_shape
+wiring, accepted risks) and in HANDOFF.md's "Batch-run design
+decisions" section - the next session should read HANDOFF.md FIRST,
+then this DEVLOG.md's full "Batch-run planning" trail, before writing
+the real batch script. Do NOT re-litigate any of the decisions already
+made this session - only the two explicitly-flagged open items above
+(is_ref scope, per-image error handling, output directory) still need
+a real answer.
+
 
 
 
