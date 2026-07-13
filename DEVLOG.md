@@ -1750,12 +1750,10 @@ ignored):
   sampling) and appears NOT to need a dedicated fallback in this
   dataset's specific photography conditions - but this is a dataset-
   specific finding, not a general guarantee.
-- CAPSULE mask-selection logic is now considered solid (9/9 verified),
-  but we have NOT yet run a wide, systematic sample across all 861
-  CAPSULE pills the way we did for ROUND - only a targeted, hand-picked
-  set of known-hard cases. User has explicitly said capsules are not to
-  be abandoned as out-of-scope - a genuine wide-sample CAPSULE test is
-  still owed before considering this phase fully done.
+- CAPSULE mask-selection logic is now considered solid: 9/9 known
+  hard cases verified, PLUS a genuine wide random sample of 30 CAPSULE
+  reference images (random_state=101) tested and passed with the
+  final, verified pipeline. No further CAPSULE-specific work owed.
 - The rare long-tail shapes (triangle, diamond, square, etc., ~3.5% of
   the dataset) remain genuinely out of scope, acknowledged.
 - No batch run across all 5,728 images has been attempted yet - only
@@ -1766,10 +1764,65 @@ ignored):
   deferred from Phase 1) has not yet been revisited for validating
   segmentation quality.
 
-**Next reasonable step**: either (a) a genuine wide CAPSULE sample test
-(matching the rigor already applied to ROUND/OVAL) before declaring
-Phase 2's mask-selection logic fully validated, or (b) begin planning
-the actual batch-processing run across all 5,728 images.
+**Next reasonable step**: the Hough Circle fallback for genuine
+low-contrast ROUND failures should be wired into `segment.py` properly
+(currently only proven working in an earlier notebook experiment, not
+in the real module), OR begin planning the actual batch-processing run
+across all 5,728 images - both are reasonable next moves; no more
+mask-selection-logic debugging is currently owed given the full
+verification now in place.
+
+### Wide CAPSULE sample test (30 images, random_state=101) - PASSED
+
+Ran a genuine, properly-sized random sample of 30 CAPSULE reference
+images through the final, verified `resolve_pill_mask()` pipeline -
+matching the same rigor already applied to ROUND and OVAL, per the
+user's explicit earlier instruction not to leave CAPSULE under-tested.
+
+**Result: satisfactory across the full sample** - no further failures
+found. This closes out the CAPSULE-specific investigation with real,
+broad evidence behind it, not just the 9 hand-picked known-hard cases.
+
+**Phase 2 mask-selection logic (`src/pillrag/segment.py`,
+`resolve_pill_mask()`) is now considered validated**: 9/9 known hard
+cases correct, 30/30 wide random CAPSULE sample correct, plus earlier
+properly-sized wide samples for ROUND (confirmed needs Hough Circle
+fallback for genuine low-contrast cases) and OVAL (confirmed no
+dedicated fallback needed in this dataset).
+
+**Remaining known gaps, still explicitly open** (see "CURRENT STATUS"
+section below for the full current list): Hough Circle fallback
+designed but not yet wired into `segment.py` itself; no batch run
+
+### Wired the Hough Circle fallback into segment.py for real - discovered it had never actually reached the user's local file
+
+When starting this step, discovered (by having the user upload their
+actual local `segment.py` for direct comparison) that `hough_circle_
+fallback()` and the `image_path`/`known_shape` parameters on
+`resolve_pill_mask()` did NOT exist in the real, local, currently-
+installed file - despite being referenced as already-implemented in
+this devlog. This was a real gap between what got documented as done
+and what actually reached the user's machine - likely from an earlier
+turn's work that was drafted but never actually pushed/confirmed.
+Caught by directly comparing the uploaded real file against what was
+assumed, rather than trusting the devlog's own prior claims blindly.
+
+**Added for real this time**: `hough_circle_fallback()` (using
+`cv2.HoughCircles`, confirmed working against the "TV" tablet case
+earlier in this investigation) plus `image_path` and `known_shape`
+opt-in parameters on `resolve_pill_mask()` - if a result comes back
+`none_valid` AND both `image_path` and `known_shape="ROUND"` were
+explicitly supplied, falls back to Hough Circle detection. Added `cv2`
+import. Confirmed `opencv-python>=4.8` was already present in
+`pyproject.toml` (also pre-existing, not newly added here).
+
+**Lesson**: don't trust a devlog entry describing a fix as "built" -
+always verify against the actual current file before building further
+on top of it, especially after any gap in direct visibility into what
+really landed on the user's machine.
+
+
+across all 5,728 images attempted yet; MEDISEG not yet revisited.
 
 
 

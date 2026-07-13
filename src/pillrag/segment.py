@@ -51,6 +51,7 @@ from __future__ import annotations
 import itertools
 from dataclasses import dataclass
 
+import cv2
 import numpy as np
 from scipy.ndimage import binary_closing
 
@@ -614,19 +615,96 @@ def _is_suspiciously_small(
     return final_area < largest_pill_shaped * min_fraction
 
 
+def hough_circle_fallback(
+    image_path: str,
+    min_radius_fraction: float = 0.2,
+    max_radius_fraction: float = 0.5,
+) -> np.ndarray | None:
+    """Classical-CV fallback for genuinely low-contrast ROUND pills,
+    where FastSAM's own detection fails entirely (returns none_valid) -
+    a real, confirmed, actively-researched limitation of the SAM/
+    FastSAM model family for "visually non-salient" scenes (see
+    DEVLOG.md "low-contrast segmentation" for the research backing
+    this). Confirmed in real testing (see DEVLOG.md): FastSAM completely
+    failed on a genuinely low-contrast round tablet ("TV" tablet,
+    gray-on-gray), but Hough Circle detection correctly found its true
+    circular boundary from the same image, even though color-based
+    thresholding (Otsu's method) only found the pill's drop SHADOW, not
+    the pill itself.
+
+    IMPORTANT SCOPE NOTE (see DEVLOG.md): this is only appropriate for
+    OFFLINE INDEXING, where the pill's shape is already known from
+    metadata. It must NOT be applied to real end-user query photos,
+    where the shape is unknown in advance - using it there would be
+    circular reasoning (the point of the query is to determine the
+    pill's identity, which implies its shape).
+
+    Args:
+        image_path: path to the (locally-extracted) image file on disk
+        min_radius_fraction / max_radius_fraction: expected circle
+            radius as a fraction of the image's own smaller dimension -
+            defaults chosen to comfortably bracket a pill that fills
+            roughly half to all of the frame, matching how our
+            reference images are typically framed
+
+    Returns:
+        A boolean mask (same H x W as the image) if a circle was found,
+        or None if no circle could be detected at all - callers should
+        treat this the same as any other None result (e.g. flag for
+        manual review), not assume a fallback always succeeds.
+    """
+    img_gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if img_gray is None:
+        return None
+
+    height, width = img_gray.shape
+    smaller_dim = min(height, width)
+    min_radius = int(smaller_dim * min_radius_fraction)
+    max_radius = int(smaller_dim * max_radius_fraction)
+
+    circles = cv2.HoughCircles(
+        img_gray,
+        cv2.HOUGH_GRADIENT,
+        dp=1,
+        minDist=smaller_dim,  # we only expect ONE pill per reference image
+        param1=80,
+        param2=30,
+        minRadius=min_radius,
+        maxRadius=max_radius,
+    )
+
+    if circles is None:
+        return None
+
+    # HoughCircles can return multiple candidates; take the first
+    # (strongest-voted) one, since we only expect one pill
+    x, y, r = circles[0][0]
+
+    mask = np.zeros((height, width), dtype=bool)
+    y_grid, x_grid = np.ogrid[:height, :width]
+    distance_from_center = np.sqrt((x_grid - x) ** 2 + (y_grid - y) ** 2)
+    mask[distance_from_center <= r] = True
+
+    return mask
+
+
 def resolve_pill_mask(
     confidences: np.ndarray,
     masks: np.ndarray,
     retry_confidence_threshold: float = DEFAULT_RETRY_CONFIDENCE_THRESHOLD,
     suspicious_area_fraction: float = DEFAULT_SUSPICIOUS_AREA_FRACTION,
+    image_path: str | None = None,
+    known_shape: str | None = None,
     **kwargs,
 ) -> MaskSelectionResult:
     """The full, real pipeline: select -> (retry if suspicious) ->
-    rescue -> close gaps.
+    rescue -> close gaps -> (Hough Circle fallback if still none_valid
+    and the pill is known to be ROUND).
 
     This is the function calling code should actually use end-to-end;
-    select_pill_mask/rescue_complementary_mask/close_internal_gaps are
-    exposed individually mainly for testing and debugging.
+    select_pill_mask/rescue_complementary_mask/close_internal_gaps/
+    hough_circle_fallback are exposed individually mainly for testing
+    and debugging.
 
     The retry step exists because a normal-threshold result can
     sometimes be built entirely from small, high-confidence noise
@@ -640,6 +718,19 @@ def resolve_pill_mask(
     plausibility) still apply, just against a wider candidate pool.
     The retry result is only accepted if it's actually larger/more
     complete than the original suspicious result.
+
+    The Hough Circle fallback exists because some genuinely low-
+    contrast ROUND pills cause FastSAM to fail completely (return
+    none_valid), a confirmed, real, actively-researched model
+    limitation (see DEVLOG.md) that no amount of our own post-
+    processing can fix, since FastSAM never produces a usable mask at
+    all in these cases. This fallback is OPT-IN: it only runs if both
+    `image_path` (needed to re-read the raw image for classical CV)
+    AND `known_shape` (needed to confirm this pill is ROUND) are
+    explicitly provided - otherwise resolve_pill_mask behaves exactly
+    as before, unaffected. See the IMPORTANT SCOPE NOTE on
+    `hough_circle_fallback` itself: known_shape must only be supplied
+    during OFFLINE INDEXING, never for real end-user query photos.
 
     Any keyword arguments are passed through to select_pill_mask (e.g.
     confidence_threshold, max_fill_ratio) where applicable by name.
@@ -675,6 +766,14 @@ def resolve_pill_mask(
                     )
 
     if base_result.final_mask is None:
+        if image_path is not None and known_shape is not None and known_shape.upper() == "ROUND":
+            hough_mask = hough_circle_fallback(image_path)
+            if hough_mask is not None:
+                return MaskSelectionResult(
+                    final_mask=hough_mask,
+                    contributing_mask_indices=(),
+                    method="hough_circle_fallback",
+                )
         return base_result
 
     rescued_result = rescue_complementary_mask(base_result, confidences, masks)
