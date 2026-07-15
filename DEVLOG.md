@@ -2195,6 +2195,326 @@ made this session - only the two explicitly-flagged open items above
 (is_ref scope, per-image error handling, output directory) still need
 a real answer.
 
+## Three open pre-script questions - all resolved, real script written
 
+Resolved via explicit ask-with-tradeoffs, not silently picked:
 
+1. **Batch scope: ALL 5,728 rows, not `is_ref==True` only.** Reasoning:
+   `is_ref` distinguishes studio reference photos from real-world
+   consumer photos - an image-quality/type distinction, not a "should
+   this be indexed" distinction. Phase 3's whole purpose is matching a
+   messy real-world user photo against the vector store; restricting
+   the batch to ref-only would build an index that structurally
+   excludes the query domain. User confirmed.
+2. **Output directory: NEW `data/masks/`, not
+   `data/samples/segmented_preview/`.** That existing directory was
+   explicitly scoped as a small ~50-image manual-QA sample, NOT the
+   real dataset. User confirmed.
+3. **Per-image try/except: required.** Sub-decision, explicitly asked:
+   a crashed image gets its own `quality_flag="error"` / `method="error"`,
+   KEPT SEPARATE from `quality_flag="fallback_full_image"` - so "FastSAM
+   legitimately found nothing" and "the pipeline crashed" can be told
+   apart later during QA. User confirmed.
 
+`batch_segment_full.py` written accordingly: two-cell Colab pattern,
+RLE via `pycocotools.mask` (`encode_rle()`), Parquet chunk files
+(~500 images/chunk) - **note: Parquet was picked over the JSON format
+implied by earlier DEVLOG wording, WITHOUT asking first** (real fork,
+flagged to user after the fact rather than before).
+
+## REAL BATCH RUN - COMPLETE (all 5,728 images)
+
+Ran successfully on Colab. Results:
+- **5,728 images, 1,688s total (~28 min), 0.295s/image mean** - matches
+  the 100-image timing test's 0.313s/image extrapolation closely.
+- **quality_flag distribution: ok=5,191 (90.6%), fallback_full_image=537
+  (9.4%), error=0**
+- Zero crashes.
+- 12 chunk files written to `data/masks/manifest_chunk_000.parquet`
+  through `_011.parquet`.
+
+**The 9.4% fallback rate is much higher than the 100-image timing
+test's ~1% extrapolation predicted** - this gap became the first thing
+worth explaining, see investigation below.
+
+## Fallback investigation (537 `fallback_full_image` cases)
+
+### Step 1: shape/color/is_ref breakdown
+
+Loaded all 12 manifest chunks (5,728 rows total, matches), joined back
+to `df` on `full_image_path` to recover `color`/`is_ref` (not carried
+in the manifest itself).
+
+Raw breakdown by shape: OVAL 219, ROUND 168, CAPSULE 102, NaN 25, plus
+small numbers of RECTANGLE/SQUARE/etc. By color: WHITE dominates
+(309/537). **This turned out to be a confound, not the real driver.**
+
+**`is_ref` breakdown was the real signal:**
+- `is_ref==False` (consumer photos): 533/3,728 = **14.3%** fallback rate
+- `is_ref==True` (studio reference photos): 4/2,000 = **0.2%** fallback rate
+- ~70x difference. All 10 randomly-sampled fallback paths were from
+  `dc_224/` (consumer photos folder).
+
+**Confound check (explicitly verified, not assumed):** shape and color
+distributions are nearly IDENTICAL between `is_ref==True` and
+`is_ref==False` groups. Held shape+color fixed and compared fallback
+rate across `is_ref` within each:
+- OVAL+WHITE: 28.8% fallback when `is_ref==False`, 0% when `is_ref==True`
+- ROUND+WHITE: 14.5% fallback when `is_ref==False`, 0% when `is_ref==True`
+
+**Conclusion: `is_ref` (consumer vs. studio photo) is the real driver,
+not shape or color.** The earlier shape/color breakdown was just
+riding along on WHITE/OVAL/ROUND being the most common pill types
+overall, in both groups equally.
+
+### Step 2: FastSAM-finds-nothing vs. select_pill_mask-rejects-everything
+
+Re-ran FastSAM fresh (not `resolve_pill_mask`) on all 533 `is_ref==False`
+fallback images, bucketed by cause:
+- `zero_masks` (FastSAM found nothing at all): **9** (1.7%)
+- `below_conf` (found masks, none cleared 0.6 confidence threshold): **118** (22%)
+- `rejected` (found confident candidates, `resolve_pill_mask` still
+  returned None): **410** (76%)
+
+**Most of the problem is NOT "FastSAM can't see the pill" - it's "our
+own filtering logic is throwing out valid FastSAM candidates."**
+
+### Step 3: traced the `rejected` bucket to the fill-ratio filter specifically
+
+Re-read `select_pill_mask`'s control flow: once >=1 candidate clears
+BOTH the confidence filter AND the fill-ratio filter
+(`max_fill_ratio=0.97`), every subsequent exit path produces a real
+mask - no other path to `final_mask=None` downstream. So the ONLY way
+`resolve_pill_mask` can return None after finding a confident candidate
+is: the fill-ratio filter rejected every single confidence-surviving
+candidate.
+
+Verified directly: re-ran FastSAM on all 410 `rejected` images, checked
+fill ratio of every above-confidence-threshold mask.
+- **410/410 (100%) fully explained by fill-ratio filter alone.**
+- Fill ratio distribution among killed candidates: mean 0.994, median
+  0.997, min 0.970.
+- Loosening the cutoff alone doesn't cleanly fix this: 0.98 → only
+  8.7% survive, 0.99 → 21.3%, 0.995 → 33.3%.
+
+### Step 4: what's producing fill ratios this close to 1.0? (two rounds of wrong/partial hypotheses, corrected via direct visual inspection)
+
+**First hypothesis (WRONG as stated):** near-1.0 fill ratio suggested
+FastSAM might be boxing the entire image frame. Checked mask area as %
+of TOTAL image (not just bbox) for all 410 - median was only ~41%,
+only 10.5% exceeded 90%, ZERO exceeded 99%. Ruled out before it went
+further.
+
+**Second hypothesis (PARTIALLY correct):** visual inspection of 4
+sample overlays included one case (`787` round tablet) where the
+contour tracked an artificial black letterbox padding bar instead of
+the pill (224x224 images pad non-square source photos with black
+bars). **Generalized this to all 410 too quickly, without checking at
+scale first** - user had to prompt "check it" before this got
+verified. Built a signature-detection check and ran it against all
+410.
+
+**Result: only 80/410 (19.5%) showed the letterbox signature.** Real
+and worth fixing, but a MINORITY cause. Side breakdown: top=50,
+bottom=16, left=11, right=3.
+
+**Third round - direct visual inspection of the remaining ~330
+non-letterbox cases (15-sample), corrected by the user, not
+self-caught:** Claude's initial read of a follow-up 4-image sample was
+that TWO different things were being conflated: (a) CAPSULE/OVAL pills
+where FastSAM's mask is CORRECT and tightly fits the actual pill
+(naturally close-to-rectangular silhouette for these shapes at close
+range), vs (b) thin background sliver artifacts, correctly rejected.
+
+**STATUS: user has directly disputed Claude's (a)/(b) read** ("all
+have the same issue... entire rectangular image is recognized as
+mask... I want to see the complete mask"). A full solid-fill mask
+render (not just a thin contour outline) was requested and the
+rendering script was written but **results not yet reviewed** at time
+of this update. This is explicitly UNRESOLVED - do NOT treat (a)/(b)
+as confirmed until the solid-mask render is actually looked at. If the
+render shows the mask truly covering ~100% of the image for the cases
+Claude labeled "correct," Claude's read was wrong and needs to be
+retracted, not defended.
+
+**MISTAKE pattern worth flagging, per this project's rule #5 (log dead
+ends, not just what worked):** two of three hypotheses in this
+investigation were wrong or incomplete as first proposed, and the
+third is currently under direct dispute pending the solid-mask render.
+Numbers-only reasoning kept producing plausible-sounding but incomplete
+pictures; the times this got corrected were when real images were
+looked at directly. Lesson: for visual/segmentation debugging, reach
+for actual image inspection SOONER, don't lean on aggregate statistics
+alone even when they seem to tell a clean story.
+
+## Immediate next step (updated)
+
+**Review the solid-mask render** (`diagnose_full_mask_render.py`,
+output in `./full_mask_samples/`, same 15 images as the disputed
+contour-only sample, same random seed 7) before drawing any conclusion
+about mechanism (a)/(b) or writing a fix. Do not resume fix-planning
+until this is actually looked at.
+
+## RESOLVED: (a)/(b) dispute settled via all-masks render (session reset in between - state rebuilt from scratch per HANDOFF's reset rule)
+
+User was right, Claude's (a)/(b) split was incomplete. Rendered ALL
+masks FastSAM produced (not just the single fill-ratio-rejected
+candidate) for a fresh 15-image sample of consumer fallbacks, each
+panel labeled with confidence/fill_ratio/area%.
+
+**Real mechanism: FastSAM frequently FUSES the pill together with a
+chunk of adjacent background into one blob**, because pill and
+background are low-contrast/similar-toned in many of these consumer
+photos - not "the whole image gets selected" (ruled out earlier via
+area-fraction check) and not purely "correct capsule/oval masks
+wrongly rejected" (Claude's incomplete first read). Confirmed
+case-by-case across the new sample:
+- Several ROUND cases (1020, 1433, 3416, 3641, 812) show a
+  fused pill+background blob at rank 0, WITH a correct, tighter,
+  unfused pill mask sitting at a lower rank/confidence in the SAME
+  FastSAM output.
+- 1537 (capsule) really is genuinely correct at rank 0 - confirms
+  mechanism (a) is real for SOME cases, just not the dominant one.
+- 425 ("b" tablet) is a genuine bad segmentation with only one mask
+  produced, no better candidate available at all.
+
+**This confirms the user's original theory from early in the fallback
+investigation** (low-contrast pill-vs-background causing FastSAM to
+fail) - Claude's letterbox and capsule/oval hypotheses were each real
+but partial; the fusion mechanism is the dominant, previously-missed
+explanation. Logged per rule #5 (dead ends/mistakes tracked, not
+hidden) - three hypotheses total in this investigation, only the
+fusion one holds up as dominant across a real sample.
+
+## Fix approach: rejected FastSAM entirely in favor of a semantic-prior model, and here's why
+
+Considered and rejected extending select_pill_mask's existing
+rescue/retry logic to just PICK the better lower-ranked mask when one
+exists (cheap, no new dependency). Explicitly asked Claude to justify
+how it would decide "this lower-confidence mask is the correct one" -
+no defensible rule available:
+  - Fill ratio alone doesn't work: background-sliver artifacts can
+    also have low-ish fill ratio in some shapes, while genuinely
+    correct CAPSULE/OVAL masks (1537) have HIGH fill ratio on purpose
+    - the exact signal that would need to discriminate correct-vs-not
+      points in opposite directions depending on shape.
+  - A shape-conditional geometric rule (e.g. deviation from expected
+    circularity for ROUND) is more logic, more surface area, and
+    structurally the same kind of heuristic that produced the
+    still-unresolved idx=9 dominance-check bug - no confidence it
+    generalizes better.
+  - No ground truth available to validate a picking rule against
+    beyond eyeballing more samples, which is expensive and exactly
+    the kind of over-indexing on small-N visual inspection this
+    investigation already got burned by twice.
+
+Decision: move to a semantic-prior segmenter (SAM 3) for the
+fallback population specifically, rather than trying to out-guess
+which FastSAM candidate is correct. SAM 3 sidesteps the
+candidate-selection problem entirely by being asked for "the pill"
+directly instead of producing ambiguous unlabeled candidates.
+
+### SAM 3 feasibility check (researched, not assumed)
+
+- Available now (released Nov 19, 2025, well before this
+  investigation) - NOT a "wait for it" situation.
+- Single unified model, native text/concept prompting - simpler than
+  the originally-proposed Grounded-SAM2 (Grounding DINO + SAM2)
+  two-model pipeline.
+- Integrated into ultralytics (>=8.3.237, SAM3SemanticPredictor)
+  - same library FastSAM already uses in this project, so it slots
+    into the existing Colab setup pattern with minimal new plumbing.
+- License: Meta's custom "SAM License" - broad research AND
+  commercial use permitted; restrictions are around military/ITAR use
+  only. Not a blocker for this project.
+- Access is gated: requires requesting access on the Hugging Face
+  model page (facebook/sam3), approval not guaranteed instant -
+  this is the one part of the plan outside our control.
+- Compute: ~840M params (~3.4GB), designed for GPU inference,
+  ~30ms/image on an H200, fits comfortably on 16GB VRAM (Colab's free
+  T4 tier) for typical workloads - heavier than FastSAM but should be
+  fine at our scale (<=537 images). MUST time on a small batch first,
+  same discipline as the original 100-image FastSAM timing test -
+  NOT yet done.
+
+## DECIDED forward plan (explicit user call)
+
+Do NOT block Phase 3 on SAM3 access approval. Sequence:
+1. NOW: proceed with Phase 3 using the current manifest AS-IS -
+   the 537 fallback_full_image rows stay exactly as they are
+   (whole-image mask, correctly flagged), development moves forward.
+2. In parallel: request SAM3 access via Hugging Face
+   (https://huggingface.co/facebook/sam3 - login, agree to SAM
+   License, submit access request form).
+3. Once access is granted: re-segment ONLY the fallback population
+   (537 images, or possibly narrowed further - not yet decided) using
+   SAM3 prompted with a pill-related text concept, producing real
+   masks to REPLACE the whole-image fallback entries.
+4. Re-index those specific images' embeddings in Phase 3 once
+   better masks exist - this is a targeted update to a known subset,
+   not a full pipeline re-run.
+
+This is a genuine "come back later" item, not an abandoned thread -
+tracked explicitly in HANDOFF.md's open-items list so it isn't lost.
+
+## REVERSED: Phase 3 index scope - reference images ONLY, not all 5,728 rows
+
+Earlier decision ("Batch scope: ALL 5,728 rows, not is_ref==True only")
+was correct for PHASE 2 (segmentation - every image needed a mask
+regardless of what it's used for downstream). It does NOT carry over
+to PHASE 3's vector index scope, which is a genuinely separate
+question - user caught this distinction, Claude had conflated them.
+
+**User's insight**: consumer (is_ref==False) images are the SAME 1,000
+pill types as the reference images, just photographed under worse
+real-world conditions - not new/different pills. Indexing them
+alongside reference images adds duplicate, noisier embeddings for
+already-represented pill types, diluting the store for no
+identification benefit.
+
+**Verified against the ePillID paper itself** (Usuyama et al., CVPR
+2020 VL3, arxiv 2005.14288) before finalizing - not just inferred:
+paper's own experimental design confirms reference images are the
+low-shot "gallery" (one image per pill type = the thing being
+searched against) and consumer images are the explicit QUERY set,
+split into train/holdout specifically for evaluating recognition
+performance against that gallery. This is exactly the design Claude
+converged on with the user - confirmed by the dataset's original
+creators, not just reasoned independently.
+
+**Coverage check (run before finalizing, not assumed):** does every
+consumer image's pilltype_id have a matching reference image in OUR
+actual 5,728-row filtered subset (not the full ePillID dataset, where
+the paper notes consumer images only exist for ~960 of ~4,902 total
+pill types - a real gap in the FULL dataset that needed checking
+against OUR subset specifically)?
+- Reference pilltype_ids in our subset: 1,000 (matches Phase 1's known
+  1,000 NDC-labeled pill types exactly)
+- Consumer pilltype_ids in our subset: 960 (matches the ePillID
+  paper's stated number exactly - good cross-check)
+- **Full coverage confirmed: 960/960 consumer pilltype_ids have a
+  matching reference image. Zero gaps.**
+- 40 reference-only pilltype_ids (no consumer image) - not a problem,
+  they just won't have eval queries testing them.
+
+## DECIDED: Phase 3 index/query split (supersedes the "index all rows" framing)
+
+- **Vector store index: reference images ONLY** (`is_ref==True`,
+  2,000 rows, 1,000 pill types). This is the searchable catalogue -
+  one embedding per pill type (or a couple, front/back).
+- **Consumer images (`is_ref==False`, 3,728 rows): NOT indexed.**
+  Used exclusively as EVALUATION QUERIES - run each through the same
+  query-time pipeline a real user's upload would go through (segment
+  -> embed -> search against the reference index), then check if it
+  correctly retrieves its own pilltype_id/label. Ground truth is
+  already known (`df["pilltype_id"]`/`df["label"]`), so this is free,
+  large-scale, realistic eval data instead of something we'd have to
+  collect ourselves.
+- **Practical consequence for the Phase 2 fallback investigation**:
+  the 533 consumer-photo `fallback_full_image` cases mostly stop being
+  an INDEX-INTEGRITY problem (they were never going into the index
+  anyway) and become an EVAL-ACCURACY problem instead (a bad
+  segmentation -> bad embedding -> that specific eval query is more
+  likely to fail to retrieve its own correct reference). The planned
+  SAM3 re-segmentation follow-up is still worth doing, just for a
+  different reason now.
