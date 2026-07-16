@@ -42,6 +42,64 @@ import torch.nn as nn
 import torchvision.models as models
 import torchvision.transforms as transforms
 
+# ============================================================
+# FastSAM wrapper - factored out here so search_visual (and any
+# future caller) uses the EXACT SAME FastSAM call Phase 2's batch run
+# used, rather than a fresh, possibly-drifted reimplementation.
+#
+# Sourced directly from batch_segment_full.py's process_one_image()
+# and colab_full_test_setup.py's model instantiation - not guessed.
+# Real facts, confirmed by reading both files:
+#   - package: ultralytics (from ultralytics import FastSAM)
+#   - checkpoint: "FastSAM-x.pt"
+#   - call: model(image_path, verbose=False) - no explicit confidence/
+#     IoU overrides at inference time; Phase 2 relies on ultralytics'
+#     FastSAM defaults and does all real filtering afterward in
+#     segment.py's own post-processing (confidence threshold, fill-
+#     ratio, etc.) - NOT at the FastSAM call itself.
+#   - masks-is-None handling: if results[0].masks is None (FastSAM
+#     found zero objects), pass an empty (0,0,0) array through rather
+#     than crashing or treating it specially - resolve_pill_mask's own
+#     None-handling (including the Hough fallback) is designed to
+#     receive this.
+#
+# `model` itself is NOT instantiated in this module - the caller must
+# already have a loaded FastSAM instance (same pattern Phase 2 used:
+# model = FastSAM("FastSAM-x.pt"), loaded once per session, not once
+# per call - loading weights per-call would be needlessly slow across
+# thousands of eval queries).
+# ============================================================
+
+def run_fastsam(model, image_path: str) -> tuple[np.ndarray, np.ndarray]:
+    """Run FastSAM on a single image, exactly as Phase 2's batch run
+    did. Returns (confidences, masks) ready to pass into
+    resolve_pill_mask().
+
+    Args:
+        model: an already-loaded `ultralytics.FastSAM("FastSAM-x.pt")`
+            instance - NOT loaded inside this function, since loading
+            weights per-call would be wasteful across many queries.
+        image_path: path to a real image file on disk (FastSAM and
+            the downstream Hough fallback both need a real path, not
+            in-memory bytes).
+
+    Returns:
+        confidences: np.ndarray of per-mask confidence scores.
+        masks: np.ndarray of shape (N, H, W), or shape (0, 0, 0) if
+            FastSAM found zero objects (matches Phase 2's exact
+            masks-is-None handling, so resolve_pill_mask sees the same
+            input shape it was validated against).
+    """
+    results = model(image_path, verbose=False)
+    confidences = results[0].boxes.conf.cpu().numpy()
+
+    if results[0].masks is not None:
+        masks = results[0].masks.data.cpu().numpy()
+    else:
+        masks = np.zeros((0, 0, 0))
+
+    return confidences, masks
+
 # ImageNet normalization constants - required because ResNet-18 was
 # trained on ImageNet-normalized inputs; feeding it raw 0-255 pixel
 # values (or even 0-1 floats without this specific mean/std) produces
