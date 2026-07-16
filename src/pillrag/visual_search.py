@@ -34,7 +34,7 @@ from dataclasses import dataclass
 import numpy as np
 from PIL import Image
 
-from pillrag.embed import run_fastsam
+from pillrag.embed import embed_image, run_fastsam
 from pillrag.segment import resolve_pill_mask
 
 
@@ -120,4 +120,73 @@ def segment_query_image(
         final_mask=full_image_mask,
         method="full_image_fallback",
         degraded=True,
+    )
+
+
+@dataclass
+class QueryEmbeddingResult:
+    """The outcome of embedding one live query photo.
+
+    embedding: 512-dim float32 ResNet-18 feature vector, produced by
+        embed_image() from the raw query image + its resolved mask.
+    method: passed through unchanged from the QuerySegmentationResult
+        that produced the mask this embedding was built from - e.g.
+        "single", "dominant+rescued", "hough_circle_fallback", or
+        "full_image_fallback". Kept alongside the embedding (not
+        discarded) so a caller doing similarity search can explain
+        WHY a given match is or isn't trustworthy, not just that it
+        exists.
+    degraded: same meaning as QuerySegmentationResult.degraded -
+        True means this embedding came from an all-True full-image
+        mask (segmentation failed entirely), NOT a genuine pill crop.
+        Callers MUST check this before presenting a match with full
+        confidence - see QuerySegmentationResult's docstring for the
+        underlying reasoning (real background pixels end up baked
+        into a degraded embedding).
+    """
+
+    embedding: np.ndarray
+    method: str
+    degraded: bool
+
+
+def embed_query_image(
+    image_path: str,
+    known_shape: str | None,
+    fastsam_model,
+) -> QueryEmbeddingResult:
+    """Segment + embed a single live query photo - the two steps
+    search_visual needs before it can query the Deep Lake index.
+
+    Thin wrapper: segment_query_image() -> embed_image(). Kept as its
+    own function (rather than inlining this into search_visual
+    directly) so the segment+embed pair can be tested and reused on
+    its own, independent of the Deep Lake query step - e.g. for the
+    eval script, which will call this same function per consumer
+    image before comparing embeddings, same as a real user's query
+    would.
+
+    Args:
+        image_path: path to the raw query image on disk.
+        known_shape: the pill shape the USER selected from a dropdown
+            at capture time, or None - passed straight through to
+            segment_query_image (see that function's docstring for
+            the full reasoning on why this is valid at query time).
+        fastsam_model: an already-loaded `ultralytics.FastSAM(...)`
+            instance - NOT loaded inside this function.
+
+    Returns:
+        QueryEmbeddingResult - embedding is always a valid (512,)
+        float32 array; method/degraded describe how the mask it was
+        built from was obtained (see QueryEmbeddingResult's
+        docstring).
+    """
+    seg_result = segment_query_image(image_path, known_shape, fastsam_model)
+
+    embedding = embed_image(image_path, seg_result.final_mask)
+
+    return QueryEmbeddingResult(
+        embedding=embedding,
+        method=seg_result.method,
+        degraded=seg_result.degraded,
     )
