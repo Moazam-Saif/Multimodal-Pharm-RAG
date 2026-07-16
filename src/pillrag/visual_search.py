@@ -29,13 +29,16 @@ should be updated there too, not treated as silently overturned.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+import deeplake
 import numpy as np
 from PIL import Image
 
 from pillrag.embed import embed_image, run_fastsam
 from pillrag.segment import resolve_pill_mask
+
+DEFAULT_DATASET_PATH = "al://saifmoazam2/pillrag-reference-embeddings"
 
 
 @dataclass
@@ -68,19 +71,21 @@ class QuerySegmentationResult:
 
 def segment_query_image(
     image_path: str,
-    known_shape: str | None,
+    known_shape: str,
     fastsam_model,
 ) -> QuerySegmentationResult:
     """Segment a single live query photo, for use in search_visual.
 
     Args:
         image_path: path to the raw query image on disk.
-        known_shape: the pill shape the USER selected from a dropdown
-            at capture time (e.g. "ROUND", "OVAL", "CAPSULE"), or None
-            if the user didn't specify one. This is passed straight
-            through to resolve_pill_mask's known_shape parameter - see
-            this module's docstring for why that's valid here despite
-            the general offline-only scope note on the Hough fallback.
+        known_shape: the pill shape the USER selected from a REQUIRED
+            dropdown at capture time (e.g. "ROUND", "OVAL", "CAPSULE").
+            The product requires the user to always provide this - it
+            is not optional, and this function assumes a real value is
+            always given. Passed straight through to resolve_pill_mask's
+            known_shape parameter - see this module's docstring for why
+            that's valid here despite the general offline-only scope
+            note on the Hough fallback.
         fastsam_model: an already-loaded `ultralytics.FastSAM(...)`
             instance - NOT loaded inside this function. Same pattern
             as embed.py's run_fastsam: loading weights per-query would
@@ -152,7 +157,7 @@ class QueryEmbeddingResult:
 
 def embed_query_image(
     image_path: str,
-    known_shape: str | None,
+    known_shape: str,
     fastsam_model,
 ) -> QueryEmbeddingResult:
     """Segment + embed a single live query photo - the two steps
@@ -168,8 +173,8 @@ def embed_query_image(
 
     Args:
         image_path: path to the raw query image on disk.
-        known_shape: the pill shape the USER selected from a dropdown
-            at capture time, or None - passed straight through to
+        known_shape: the pill shape the USER selected from a REQUIRED
+            dropdown at capture time - passed straight through to
             segment_query_image (see that function's docstring for
             the full reasoning on why this is valid at query time).
         fastsam_model: an already-loaded `ultralytics.FastSAM(...)`
@@ -189,4 +194,141 @@ def embed_query_image(
         embedding=embedding,
         method=seg_result.method,
         degraded=seg_result.degraded,
+    )
+
+
+@dataclass
+class PillMatch:
+    """One candidate match returned from the Deep Lake index.
+
+    similarity: raw COSINE_SIMILARITY score against the query
+        embedding, as returned by Deep Lake - NOT adjusted or boosted
+        by shape_matched. Higher is more similar (max 1.0).
+    shape_matched: True if this row's own `shape` metadata equals the
+        user's known_shape, OR if this row's shape is missing/empty
+        (Phase 1's ~3.2% unrecovered-metadata rows) - a missing label
+        is NOT evidence of a wrong shape, so those rows stay eligible
+        rather than being excluded. False only for a row with a KNOWN,
+        different shape (e.g. user said ROUND, row says OVAL).
+    """
+
+    pilltype_id: str
+    label: str
+    drug_name: str
+    color: str
+    shape: str
+    similarity: float
+    shape_matched: bool
+
+
+@dataclass
+class SearchVisualResult:
+    """The full outcome of one search_visual() call.
+
+    matches: ranked list of PillMatch, best similarity first, already
+        filtered to shape_matched==True rows only (see search_visual's
+        docstring for the exact filter rule).
+    method / degraded: passed through from QueryEmbeddingResult - see
+        that dataclass's docstring. Callers MUST check `degraded`
+        before presenting `matches` with full confidence - a degraded
+        embedding (full-image fallback) makes every match in `matches`
+        less trustworthy, not just informational.
+    """
+
+    matches: list[PillMatch] = field(default_factory=list)
+    method: str = ""
+    degraded: bool = False
+
+
+def search_visual(
+    image_path: str,
+    known_shape: str,
+    fastsam_model,
+    top_k: int = 10,
+    dataset_path: str = DEFAULT_DATASET_PATH,
+) -> SearchVisualResult:
+    """Identify a pill from a real query photo: segment -> embed ->
+    query the Deep Lake reference index -> return ranked matches.
+
+    Shape filtering rule (explicit product decision this session, NOT
+    a soft re-rank/boost): known_shape is REQUIRED - the user always
+    selects it from a dropdown before taking the photo. Only rows
+    where `shape == known_shape` OR `shape == ""` (missing metadata,
+    Phase 1's ~3.2% unrecovered rows - stored as empty string, not
+    None, per upload_to_deeplake.py's nullable-field convention) are
+    eligible to appear in `matches`. Rows with a KNOWN, DIFFERENT
+    shape (e.g. user said ROUND, row says OVAL) are excluded entirely
+    - this is a hard filter, not a ranking nudge. Known, accepted
+    residual risk: a row whose shape label is simply WRONG (e.g.
+    genuinely round but mislabeled OVAL in Pillbox) would still be
+    incorrectly excluded - this only fixes the missing-label case, not
+    a mislabeled one.
+
+    Args:
+        image_path: path to the raw query photo on disk.
+        known_shape: REQUIRED - the pill shape the user selected from
+            a dropdown at capture time (e.g. "ROUND", "OVAL",
+            "CAPSULE"). Must match the exact shape strings used in
+            the reference dataset's `shape` column (Pillbox-sourced,
+            see data.py) for the filter to work correctly.
+        fastsam_model: an already-loaded `ultralytics.FastSAM(...)`
+            instance.
+        top_k: how many ranked matches to return, after shape
+            filtering. Note this is NOT the same as how many rows
+            Deep Lake is asked for internally - see implementation
+            note below.
+        dataset_path: the Deep Lake dataset to query. Defaults to the
+            live reference-embeddings dataset confirmed in
+            upload_to_deeplake.py / HANDOFF.md.
+
+    Returns:
+        SearchVisualResult - matches is shape-filtered and similarity-
+        ranked, already limited to top_k. method/degraded describe the
+        query embedding's own segmentation quality (see
+        QueryEmbeddingResult's docstring) - NOT per-match quality, all
+        matches share the same query-side method/degraded values.
+
+    Implementation note (verify at runtime, per project rule #3 - this
+    embedding-as-TQL-array-literal pattern is new to this codebase,
+    confirmed against current deeplake docs but not yet run against
+    the real live dataset): the query embedding is formatted as a
+    comma-joined string and interpolated into a TQL ARRAY[...]
+    literal, e.g. ARRAY[0.1,0.2,...,0.9]. Deep Lake's shape filter is
+    applied in the SAME query via WHERE, not as a separate step, so
+    Deep Lake itself only needs to return top_k rows total (no
+    over-fetch-then-filter-in-Python needed, unlike a soft-boost
+    approach would require).
+    """
+    query_embedding_result = embed_query_image(image_path, known_shape, fastsam_model)
+    embedding_str = ",".join(str(float(c)) for c in query_embedding_result.embedding)
+
+    tql = f"""
+        SELECT *, COSINE_SIMILARITY(embedding, ARRAY[{embedding_str}]) AS similarity
+        FROM "{dataset_path}"
+        WHERE shape = '{known_shape}' OR shape = ''
+        ORDER BY COSINE_SIMILARITY(embedding, ARRAY[{embedding_str}]) DESC
+        LIMIT {top_k}
+    """
+
+    view = deeplake.query(tql)
+
+    matches = []
+    for row in view:
+        row_shape = row["shape"]
+        matches.append(
+            PillMatch(
+                pilltype_id=row["pilltype_id"],
+                label=row["label"],
+                drug_name=row["drug_name"],
+                color=row["color"],
+                shape=row_shape,
+                similarity=float(row["similarity"]),
+                shape_matched=(row_shape == known_shape or row_shape == ""),
+            )
+        )
+
+    return SearchVisualResult(
+        matches=matches,
+        method=query_embedding_result.method,
+        degraded=query_embedding_result.degraded,
     )
