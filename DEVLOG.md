@@ -2518,3 +2518,113 @@ against OUR subset specifically)?
   likely to fail to retrieve its own correct reference). The planned
   SAM3 re-segmentation follow-up is still worth doing, just for a
   different reason now.
+
+## Phase 3: reference embeddings - DONE, with a real bug found and fixed along the way
+
+batch_embed_reference.py run 1: 0/2000 embedded, all skipped with
+`'Pandas' object has no attribute 'pilltype_id'`. ROOT CAUSE: the
+manifest.merge(df[...]) join re-selected pilltype_id from df, but
+manifest ALREADY has its own pilltype_id column (Phase 2 schema) -
+pandas silently renamed both to pilltype_id_x/pilltype_id_y on merge,
+so every itertuples() row lacked a plain .pilltype_id attribute. Fix:
+only select is_ref/medicine_name/color from df in the join (the
+columns manifest genuinely lacks), not pilltype_id/label/shape which
+manifest already carries.
+
+Also added a fail-loudly guard: zero successful embeddings now raises
+immediately with a clear message, instead of writing an empty output
+and crashing much later on an unrelated line (embeddings_df.iloc[0])
+with a confusing IndexError - this is exactly what happened on the
+buggy run, and the real error was buried under 2000 lines of
+[SKIPPED] messages.
+
+Run 2 (post-fix): **2000/2000 embedded, 0 skipped, 36s total
+(0.018s/image mean).** Output: reference_embeddings.parquet
+(full_image_path, embedding[512], pilltype_id, label, drug_name,
+color, shape). Shape/dtype sanity check passed.
+
+## Immediate next step
+
+Phase 3 index-side data (2000 reference embeddings) is ready. Not yet
+done: Deep Lake upload/index creation, search_visual query function,
+eval script running the 3,728 consumer images as queries against the
+reference index (per the DECIDED reference-only index scope), and the
+embed_image(image_path, mask) signature question is technically
+answered (that's the signature actually built and used successfully)
+but was never given an explicit final user confirmation - worth a
+quick check-in if anything about it needs revisiting before building
+search_visual on top of it.
+
+## Phase 3: Deep Lake upload - DONE, dataset live and verified
+
+Real dataset created: `al://saifmoazam2/pillrag-reference-embeddings`
+(Deep Lake v4.x native API, org-managed cloud storage, NOT the
+LangChain wrapper).
+
+**SECURITY INCIDENT (resolved):** an Activeloop API token was pasted
+directly into chat by the user mid-session. Flagged immediately,
+user was told to revoke it at app.activeloop.ai and generate a
+replacement BEFORE any further work - confirmed done before
+proceeding. All Deep Lake scripts from this point on read the token
+exclusively from the ACTIVELOOP_TOKEN environment variable, set by
+the user in their own Colab session (via Secrets manager, recommended,
+or a session-local os.environ assignment) - no script written this
+session contains, prints, or logs the actual token value anywhere.
+
+**Bugs hit and fixed along the way (per rule #5 - log dead ends too):**
+1. First "complete setup" attempt only covered Deep Lake auth, NOT the
+   base session rebuild (Drive mount, df/model/ZIP_PATH) - caused a
+   FileNotFoundError on reference_embeddings.parquet in the very next
+   script, because Drive wasn't mounted. User correctly called this
+   out ("i told you we need to do complete setup") - fixed by merging
+   full base-session rebuild INTO the Deep Lake setup script, in the
+   correct order (Drive/packages/df first, THEN token/auth check),
+   plus an explicit check that reference_embeddings.parquet exists
+   before even getting to the token checks.
+2. `types.Embedding(dtype=..., dimensions=...)` - WRONG kwargs for the
+   actually-installed deeplake 4.6.5 (docs pulled during research used
+   different/newer kwarg names than what's shipped). Real signature
+   confirmed directly from the TypeError message: `size=`, `dtype=` as
+   a string default 'float32'. Fixed to `types.Embedding(size=512,
+   dtype="float32")` - lesson: trust the runtime error's own reported
+   signature over doc-page examples when they conflict, especially for
+   a fast-moving library.
+3. That Embedding() crash left a PARTIALLY created dataset at the
+   target path (deeplake.create() succeeds before add_column() calls,
+   so the empty shell persisted) - `deeplake.create()` refuses to
+   recreate over it. Diagnosed via a dedicated script BEFORE deciding
+   what to do (confirmed 0 rows, empty schema - nothing real to lose)
+   rather than guessing/force-deleting blindly. upload_to_deeplake.py
+   now has a built-in check: if a dataset already exists at the target
+   path with 0 rows, auto-delete and recreate; if it has real rows,
+   REFUSE and require manual confirmation - never auto-delete data
+   that might be real.
+
+**Benign, confirmed-harmless noise**: `WARNING:deeplake.storage.s3:
+[S3] Failed to get bucket region ... INVALID_ACCESS_KEY_ID snark-hub`
+appears on every deeplake.create/open call against al:// paths in this
+environment - Deep Lake internally probing for optional direct-S3
+credentials that aren't configured, unrelated to the actual
+ACTIVELOOP_TOKEN-based auth path that IS working. Confirmed harmless
+by the fact that every operation succeeded and verified correctly
+despite the warning appearing every time. Not investigated further -
+proportionate effort, this is well-understood noise now, not worth
+more digging.
+
+**Final verified state:**
+- 2000/2000 rows uploaded and committed.
+- Schema: full_image_path (text), embedding (embedding(512,
+  clustered, index=clustered) - has a similarity-search index, not
+  just raw storage), pilltype_id/label/drug_name/color/shape (text).
+- Re-opened FRESH (not the same in-memory ds object) read-only and
+  re-verified row count + a real spot-check (row 0 has a genuine
+  full_image_path, pilltype_id, and correctly-shaped (512,) embedding)
+  - not just trusting commit() succeeding silently.
+
+## Immediate next step
+
+Deep Lake vector store is live and ready to query. Not yet done:
+search_visual query function (segment -> embed -> query Deep Lake for
+nearest neighbors), and the eval script running all 3,728 consumer
+images as queries against this index to measure real retrieval
+accuracy - the actual test of whether Phase 2+3 work end to end.
