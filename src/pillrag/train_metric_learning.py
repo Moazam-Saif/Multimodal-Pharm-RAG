@@ -103,6 +103,10 @@ import numpy as np
 import pandas as pd
 import albumentations as A
 import cv2
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as models
 from albumentations.pytorch import ToTensorV2
 from PIL import Image
 from pycocotools import mask as maskUtils
@@ -112,6 +116,20 @@ from pillrag.data import EPILLID_ZIP, build_pill_dataset
 from pillrag.embed import IMAGENET_MEAN, IMAGENET_STD, mask_bounding_box
 
 TRAIN_RESOLUTION = 384
+
+# ResNet-50's penultimate-layer (post-global-avg-pool) output size -
+# this is what SHIPS as the real embedding after training (same role
+# embed.py's EMBED_SIZE=512 plays for ResNet-18 today; ResNet-50's
+# is 2048, not 512 - a real, expected consequence of the backbone
+# upgrade, not a bug). The projection head below is training-only and
+# is discarded at inference time - see PillEmbeddingModel's docstring.
+BACKBONE_EMBED_SIZE = 2048
+
+# Standard SupCon projection head output size (Khosla et al. 2020's
+# own default, and the ePillID paper's baseline follows the same
+# convention) - NOT the shipped embedding size. Only used to compute
+# the contrastive loss during training.
+PROJECTION_SIZE = 128
 
 # Where extract_reference_images() unpacks the ~2,000 is_ref==True
 # training images to real disk (Option A: extract-once, not
@@ -589,6 +607,167 @@ class PillBalancedBatchSampler:
         return -(-len(self.pilltype_ids) // self.pilltypes_per_batch)  # ceil div
 
 
+class PillEmbeddingModel(nn.Module):
+    """ResNet-50 backbone (ImageNet-pretrained, upgrade from embed.py's
+    ResNet-18 - matches the ePillID paper's own baseline architecture,
+    see this module's docstring) + a SupCon projection head.
+
+    TRAINING vs. INFERENCE split (standard SupCon convention - Khosla
+    et al. 2020): the projection head exists ONLY to compute the
+    contrastive loss during training. It is explicitly NOT what gets
+    shipped as the final embedding - after training, downstream code
+    (the eventual replacement for embed.py's embed_image()) should use
+    `self.backbone_embedding(x)` directly (2048-dim, L2-normalized),
+    NOT `self.forward(x)`'s projection-head output (128-dim). This
+    mirrors embed.py's own docstring precedent of keeping training-
+    time and shipped-embedding concerns clearly separated.
+
+    forward() returns the L2-normalized PROJECTION output (128-dim) -
+    what SupConLoss consumes. backbone_embedding() returns the
+    L2-normalized BACKBONE output (2048-dim) - what the real pill-RAG
+    system will eventually use for indexing/search, once this model
+    replaces the ResNet-18 in embed.py.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        resnet50 = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+        # Strip the final FC classification layer, keep everything up
+        # to (and including) the last global-average-pooling layer -
+        # same pattern as embed.py's _build_feature_extractor().
+        self.backbone = nn.Sequential(*list(resnet50.children())[:-1])
+
+        self.projection_head = nn.Sequential(
+            nn.Linear(BACKBONE_EMBED_SIZE, BACKBONE_EMBED_SIZE),
+            nn.ReLU(inplace=True),
+            nn.Linear(BACKBONE_EMBED_SIZE, PROJECTION_SIZE),
+        )
+
+    def backbone_embedding(self, x: torch.Tensor) -> torch.Tensor:
+        """The real, shippable embedding - L2-normalized 2048-dim
+        ResNet-50 features. Does NOT pass through the projection head.
+        This is what embed_image()'s eventual ResNet-50 replacement
+        should call, and what gets indexed into Deep Lake / used for
+        query-time similarity search - NOT forward()'s output.
+        """
+        features = self.backbone(x)
+        features = torch.flatten(features, 1)
+        return F.normalize(features, p=2, dim=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """TRAINING-ONLY path: backbone -> projection head -> L2-norm.
+        Returns the 128-dim projection SupConLoss operates on. This is
+        NOT the embedding that gets shipped - see backbone_embedding()
+        and this class's docstring.
+        """
+        features = self.backbone(x)
+        features = torch.flatten(features, 1)
+        projected = self.projection_head(features)
+        return F.normalize(projected, p=2, dim=1)
+
+
+class SupConLoss(nn.Module):
+    """Supervised Contrastive Loss (Khosla et al. 2020).
+
+    For each anchor in a batch, pulls its embedding toward all OTHER
+    embeddings sharing its label (positives) and pushes it away from
+    every embedding with a different label (negatives) - the direct
+    "same pill close, different pill far" objective that motivated
+    this whole Phase 4 retrain (see this module's top docstring for
+    the diagnostic trail establishing why a zero-shot ImageNet
+    embedding space wasn't already doing this).
+
+    Standard formulation, not a simplified/approximate variant:
+    for each anchor i,
+        L_i = -1/|P(i)| * sum_{p in P(i)} log(
+            exp(z_i . z_p / temperature)
+            / sum_{a in A(i)} exp(z_i . z_a / temperature)
+        )
+    where P(i) = all OTHER samples in the batch sharing i's label,
+    A(i) = all samples in the batch except i itself, and z are the
+    L2-normalized projection-head outputs (PillEmbeddingModel.forward's
+    output - NOT the raw backbone embedding).
+
+    With this project's BALANCED batch sampler (see
+    PillBalancedBatchSampler), every anchor has EXACTLY ONE positive
+    in every full batch (its pilltype's other image) - |P(i)|=1 for
+    every anchor in a full batch, simplifying the numerator to a
+    single term, though the implementation below stays general (does
+    not hard-code |P(i)|=1) so it's still correct on the final,
+    possibly-short batch of an epoch where sampler.pilltypes_per_batch
+    doesn't evenly divide the pilltype count.
+    """
+
+    def __init__(self, temperature: float = 0.07):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, embeddings: torch.Tensor, labels: list[str]) -> torch.Tensor:
+        """
+        Args:
+            embeddings: (batch_size, projection_size) L2-normalized
+                tensor - PillEmbeddingModel.forward()'s output.
+            labels: list of length batch_size, one pilltype_id string
+                per embedding, same order. NOT converted to a tensor
+                by the caller - this function handles the string ->
+                positive-pair-mask conversion internally, since
+                pilltype_id is a string, not an int class index, and
+                no fixed class-id mapping exists (or should exist -
+                the whole point of a metric-learning approach is not
+                needing a fixed closed set of classes).
+
+        Returns:
+            scalar loss tensor (mean over all anchors that have at
+            least one positive in the batch).
+        """
+        device = embeddings.device
+        batch_size = embeddings.shape[0]
+
+        # (batch_size, batch_size) boolean: True where row i and row j
+        # share the same pilltype_id (including i==j, removed below).
+        labels_array = np.array(labels)
+        same_label = torch.tensor(
+            labels_array[:, None] == labels_array[None, :], device=device
+        )
+
+        self_mask = torch.eye(batch_size, dtype=torch.bool, device=device)
+        positive_mask = same_label & ~self_mask  # P(i) per row, excludes self
+        negative_mask = ~same_label  # everyone with a DIFFERENT label than i
+
+        # A(i) = every sample except i itself (positives AND negatives,
+        # per the SupCon denominator definition above).
+        all_except_self_mask = ~self_mask
+
+        similarity = torch.matmul(embeddings, embeddings.T) / self.temperature
+
+        # Numerical stability: subtract the row-wise max before exp(),
+        # standard log-sum-exp trick - does not change the result
+        # (the max cancels in the ratio) but avoids overflow.
+        similarity = similarity - similarity.max(dim=1, keepdim=True).values.detach()
+        exp_similarity = torch.exp(similarity)
+
+        denominator = (exp_similarity * all_except_self_mask).sum(dim=1)
+        log_prob = similarity - torch.log(denominator.unsqueeze(1) + 1e-12)
+
+        num_positives_per_anchor = positive_mask.sum(dim=1)
+        # Anchors with zero positives in this batch (shouldn't happen
+        # with the balanced sampler on a full batch, but the FINAL,
+        # possibly-short batch of an epoch could in principle produce
+        # one if pilltypes_per_batch splits oddly - defensive, not
+        # expected in practice) contribute 0 loss rather than NaN from
+        # a divide-by-zero, and are excluded from the mean below.
+        safe_denominator = num_positives_per_anchor.clamp(min=1)
+        mean_log_prob_positive = (
+            (positive_mask * log_prob).sum(dim=1) / safe_denominator
+        )
+
+        has_positive = num_positives_per_anchor > 0
+        loss_per_anchor = -mean_log_prob_positive[has_positive]
+
+        return loss_per_anchor.mean()
+
+
 if __name__ == "__main__":
     # Quick manual check when run directly: python -m pillrag.train_metric_learning
     ref_df = load_reference_manifest()
@@ -637,3 +816,56 @@ if __name__ == "__main__":
     print(f"Non-full batches (excluding final): {bad_batches} (should be 0)")
     print(f"Final batch size: {len(batches[-1])} images "
           f"({len(batches[-1]) // 2} pilltypes)")
+
+    # --- Model + loss sanity check on a REAL batch (not random noise) ---
+    # Confirms shapes and a real forward+backward pass work end to end
+    # before committing to a full training loop - per rule #3, verify
+    # before building further, don't assume architecture code is
+    # correct just because it imports cleanly.
+    print("\n" + "=" * 60)
+    print("STEP 5: PillEmbeddingModel + SupConLoss sanity check")
+    print("=" * 60)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    model = PillEmbeddingModel().to(device)
+
+    first_batch_indices = batches[0]
+    images = []
+    pilltype_ids = []
+    for idx in first_batch_indices:
+        image_tensor, pilltype_id = train_dataset[idx]
+        images.append(image_tensor)
+        pilltype_ids.append(pilltype_id)
+
+    image_batch = torch.stack(images).to(device)
+    print(f"Real batch: {image_batch.shape[0]} images, "
+          f"{len(set(pilltype_ids))} unique pilltypes")
+
+    projections = model(image_batch)
+    print(f"Projection output shape: {tuple(projections.shape)} "
+          f"(expected: ({image_batch.shape[0]}, {PROJECTION_SIZE}))")
+    print(f"Projection L2 norms (should all be ~1.0): "
+          f"min={projections.norm(dim=1).min().item():.4f}, "
+          f"max={projections.norm(dim=1).max().item():.4f}")
+
+    backbone_embeddings = model.backbone_embedding(image_batch)
+    print(f"Backbone embedding shape: {tuple(backbone_embeddings.shape)} "
+          f"(expected: ({image_batch.shape[0]}, {BACKBONE_EMBED_SIZE}))")
+
+    criterion = SupConLoss(temperature=0.07)
+    loss = criterion(projections, pilltype_ids)
+    print(f"SupCon loss (real batch, untrained weights): {loss.item():.4f}")
+
+    loss.backward()
+    grad_norms = [
+        p.grad.norm().item()
+        for p in model.parameters()
+        if p.grad is not None
+    ]
+    print(f"Backward pass: {len(grad_norms)} parameter tensors received "
+          f"gradients (should be > 0), "
+          f"mean grad norm: {np.mean(grad_norms):.6f}")
+
+    print("\nModel + loss sanity check complete.")
