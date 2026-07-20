@@ -64,6 +64,30 @@ Real decisions made this session (see DEVLOG.md for full reasoning):
     scheme, since the dataset is small, fixed-size, and every class
     has the same number of images (2) - no real benefit to the more
     complex alternative here.
+  - Data quality check (verified this session, not assumed): confirmed
+    via real script output that every one of the 1,000 reference
+    pilltype_ids has exactly 2 images, no exceptions, no missing types
+    - the balanced sampler's "both images of N pill types per batch"
+    design is safe to rely on. Also found 4/2000 reference rows have
+    quality_flag=fallback_full_image (degenerate all-True mask, real
+    background pixels baked into the embedding per embed.py's own
+    documented consequence). Checked whether any pilltype_id has BOTH
+    its images as fallback (zero real signal for that class, not just
+    one degraded side of a pair) - found exactly one:
+    00093-1003-01_B326D9D6. Explicit decision: EXCLUDE this one
+    pilltype_id from the training split entirely (see
+    EXCLUDED_ZERO_SIGNAL_PILLTYPES below) - training a positive pair
+    from two background-heavy full-image crops would teach the model
+    "these images are the same class" based on background/lighting
+    similarity, not real pill signal, which is actively harmful rather
+    than neutral noise. The other 3 fallback rows (each has one real
+    `ok` sibling image) are kept as-is - a materially different,
+    milder situation with real signal still present on one side of
+    the pair. This pilltype_id is NOT removed from the manifest load
+    itself (still visible/countable in load_reference_manifest's
+    output) - only excluded at the train/val split stage, so it's
+    still present for anyone inspecting the raw reference data, and
+    still exists in the live Deep Lake index / eval set as before.
 """
 
 from __future__ import annotations
@@ -86,6 +110,13 @@ MANIFEST_GLOB = os.environ.get(
 
 TRAIN_VAL_SPLIT_SEED = 42
 N_VAL_PILLTYPES = 200
+
+# Verified this session (see this module's docstring): the ONLY
+# reference pilltype_id where BOTH images are quality_flag=
+# fallback_full_image, i.e. zero real pill-crop signal. Excluded from
+# the train/val split - NOT from load_reference_manifest's output, and
+# NOT from the live Deep Lake index / eval set.
+EXCLUDED_ZERO_SIGNAL_PILLTYPES = ["00093-1003-01_B326D9D6"]
 
 
 def load_reference_manifest() -> pd.DataFrame:
@@ -166,8 +197,17 @@ def make_train_val_split(
     finishes. This split is ONLY about which reference pilltype_ids
     the training loop gets to see vs. which it doesn't, for the
     purpose of checkpoint selection / monitoring training progress.
+
+    EXCLUDED_ZERO_SIGNAL_PILLTYPES (currently just
+    00093-1003-01_B326D9D6) are removed before splitting - see this
+    module's docstring for why. They end up in NEITHER train_df NOR
+    val_df.
     """
-    all_pilltype_ids = sorted(reference_df["pilltype_id"].unique())
+    eligible_df = reference_df[
+        ~reference_df["pilltype_id"].isin(EXCLUDED_ZERO_SIGNAL_PILLTYPES)
+    ]
+
+    all_pilltype_ids = sorted(eligible_df["pilltype_id"].unique())
 
     rng = random.Random(seed)
     shuffled = all_pilltype_ids.copy()
@@ -176,11 +216,11 @@ def make_train_val_split(
     val_pilltype_ids = shuffled[:n_val_pilltypes]
     train_pilltype_ids = shuffled[n_val_pilltypes:]
 
-    train_df = reference_df[
-        reference_df["pilltype_id"].isin(train_pilltype_ids)
+    train_df = eligible_df[
+        eligible_df["pilltype_id"].isin(train_pilltype_ids)
     ].reset_index(drop=True)
-    val_df = reference_df[
-        reference_df["pilltype_id"].isin(val_pilltype_ids)
+    val_df = eligible_df[
+        eligible_df["pilltype_id"].isin(val_pilltype_ids)
     ].reset_index(drop=True)
 
     return TrainValSplit(
@@ -199,10 +239,13 @@ if __name__ == "__main__":
     print(f"quality_flag breakdown:\n{ref_df['quality_flag'].value_counts()}")
 
     split = make_train_val_split(ref_df)
-    print(f"\nTrain pilltypes: {len(split.train_pilltype_ids)}, "
+    print(f"\nExcluded zero-signal pilltypes: {EXCLUDED_ZERO_SIGNAL_PILLTYPES}")
+    print(f"Train pilltypes: {len(split.train_pilltype_ids)}, "
           f"images: {len(split.train_df)}")
     print(f"Val pilltypes: {len(split.val_pilltype_ids)}, "
           f"images: {len(split.val_df)}")
+    print(f"Total eligible pilltypes (1000 - excluded): "
+          f"{len(split.train_pilltype_ids) + len(split.val_pilltype_ids)}")
 
     # Sanity check: no pilltype_id leakage across splits
     overlap = set(split.train_pilltype_ids) & set(split.val_pilltype_ids)
