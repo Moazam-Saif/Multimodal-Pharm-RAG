@@ -141,6 +141,17 @@ MANIFEST_GLOB = os.environ.get(
 TRAIN_VAL_SPLIT_SEED = 42
 N_VAL_PILLTYPES = 200
 
+# Batch size, expressed in PILL TYPES, not images. With exactly 2
+# images/pilltype (verified, see this module's docstring), N=64
+# pilltypes/batch = 128 images/batch - a reasonable default SupCon
+# batch size, chosen for Colab free-tier T4 memory headroom at
+# 384x384 resolution with a ResNet-50 backbone. NOT tuned against a
+# real memory profile yet - this is an assumption, not a measured
+# constraint. If training hits OOM, the first thing to try is
+# lowering this, not the resolution/backbone (those were separate,
+# deliberate Phase 4 decisions - see DEVLOG.md).
+N_PILLTYPES_PER_BATCH = 64
+
 # Verified this session (see this module's docstring): the ONLY
 # reference pilltype_id where BOTH images are quality_flag=
 # fallback_full_image, i.e. zero real pill-crop signal. Excluded from
@@ -472,6 +483,89 @@ class PillPairDataset(Dataset):
         return image_tensor, row["pilltype_id"]
 
 
+class PillBalancedBatchSampler:
+    """Yields batches of DATAFRAME ROW INDICES (not pilltype_ids) into
+    a PillPairDataset, guaranteeing every batch contains BOTH images of
+    each pill type it draws - the real positive pairs SupCon needs to
+    have any "pull together" signal at all (see this module's
+    docstring for why plain random shuffling was rejected: with only
+    ~2 images/class, most random batches would have zero true positive
+    pairs, wasting half the loss).
+
+    Epoch definition (Option 1, decided - see DEVLOG.md/HANDOFF.md):
+    one epoch = every pill type in `dataframe` appears in EXACTLY ONE
+    batch. Implemented by shuffling the full list of pilltype_ids once
+    per epoch, then chopping it into consecutive groups of
+    `pilltypes_per_batch` - NOT a fixed-batches-per-epoch or
+    sample-with-replacement scheme, since the dataset is small,
+    fixed-size, and every class has exactly the same image count (2) -
+    no benefit to the more complex alternative here.
+
+    The FINAL batch of an epoch may contain fewer than
+    `pilltypes_per_batch` pill types if the total doesn't divide
+    evenly - this is expected and left as-is (not padded/dropped),
+    since dropping it would mean some pill types never appear in some
+    epochs, and padding would require picking which pilltypes get
+    repeated, an arbitrary choice not worth adding complexity for.
+
+    Assumes (and asserts) that `dataframe` has been through
+    make_train_val_split() and EXCLUDED_ZERO_SIGNAL_PILLTYPES has
+    already been removed - it does NOT special-case pilltypes with
+    other than exactly 2 images, since that invariant was verified
+    project-wide (see this module's docstring's "Data quality check").
+    """
+
+    def __init__(
+        self,
+        dataframe: pd.DataFrame,
+        pilltypes_per_batch: int = N_PILLTYPES_PER_BATCH,
+        seed: int = TRAIN_VAL_SPLIT_SEED,
+    ):
+        self.dataframe = dataframe.reset_index(drop=True)
+        self.pilltypes_per_batch = pilltypes_per_batch
+        self.rng = random.Random(seed)
+
+        # Map each pilltype_id -> list of its row indices into
+        # self.dataframe (should be exactly 2 per pilltype, given the
+        # project-wide verified invariant - not enforced here with a
+        # hard assert to avoid crashing on a not-yet-excluded fallback
+        # pilltype during interactive debugging, but real production
+        # training should have already run make_train_val_split()).
+        self._pilltype_to_indices: dict[str, list[int]] = (
+            self.dataframe.groupby("pilltype_id").indices
+        )
+        self._pilltype_to_indices = {
+            pilltype_id: list(indices)
+            for pilltype_id, indices in self._pilltype_to_indices.items()
+        }
+        self.pilltype_ids = sorted(self._pilltype_to_indices.keys())
+
+    def __iter__(self):
+        shuffled_pilltype_ids = self.pilltype_ids.copy()
+        self.rng.shuffle(shuffled_pilltype_ids)
+
+        for start in range(0, len(shuffled_pilltype_ids), self.pilltypes_per_batch):
+            batch_pilltype_ids = shuffled_pilltype_ids[
+                start : start + self.pilltypes_per_batch
+            ]
+
+            batch_indices: list[int] = []
+            for pilltype_id in batch_pilltype_ids:
+                batch_indices.extend(self._pilltype_to_indices[pilltype_id])
+
+            # Shuffle within the batch so the two images of any given
+            # pilltype aren't always adjacent - avoids any accidental
+            # ordering dependency downstream (e.g. in the loss
+            # implementation) relying on positive pairs sitting at
+            # fixed relative positions within a batch.
+            self.rng.shuffle(batch_indices)
+
+            yield batch_indices
+
+    def __len__(self) -> int:
+        return -(-len(self.pilltype_ids) // self.pilltypes_per_batch)  # ceil div
+
+
 if __name__ == "__main__":
     # Quick manual check when run directly: python -m pillrag.train_metric_learning
     ref_df = load_reference_manifest()
@@ -491,3 +585,32 @@ if __name__ == "__main__":
     # Sanity check: no pilltype_id leakage across splits
     overlap = set(split.train_pilltype_ids) & set(split.val_pilltype_ids)
     print(f"\nTrain/val pilltype_id overlap (should be 0): {len(overlap)}")
+
+    # Verify the balanced batch sampler for real - don't assume the
+    # logic is right just because it reads correctly, per rule #3.
+    train_dataset = PillPairDataset(split.train_df, augment=True)
+    sampler = PillBalancedBatchSampler(split.train_df)
+
+    print(f"\nSampler: {len(split.train_pilltype_ids)} train pilltypes, "
+          f"{N_PILLTYPES_PER_BATCH} pilltypes/batch "
+          f"-> expected {len(sampler)} batches/epoch")
+
+    batches = list(sampler)
+    print(f"Actual batches yielded: {len(batches)}")
+
+    total_images_seen = sum(len(b) for b in batches)
+    print(f"Total image-indices across all batches: {total_images_seen} "
+          f"(should equal train_df length: {len(split.train_df)})")
+
+    # Confirm every full-size batch has EXACTLY 2 rows per pilltype_id
+    # (a real positive pair for every image, every batch) - check all
+    # but the possibly-short final batch.
+    bad_batches = 0
+    for batch_indices in batches[:-1]:
+        batch_pilltype_ids = split.train_df.loc[batch_indices, "pilltype_id"]
+        counts = batch_pilltype_ids.value_counts()
+        if not (counts == 2).all():
+            bad_batches += 1
+    print(f"Non-full batches (excluding final): {bad_batches} (should be 0)")
+    print(f"Final batch size: {len(batches[-1])} images "
+          f"({len(batches[-1]) // 2} pilltypes)")
