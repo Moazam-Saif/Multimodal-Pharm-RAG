@@ -95,7 +95,9 @@ from __future__ import annotations
 import glob
 import os
 import random
+import zipfile
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -106,10 +108,30 @@ from PIL import Image
 from pycocotools import mask as maskUtils
 from torch.utils.data import Dataset
 
-from pillrag.data import build_pill_dataset
+from pillrag.data import EPILLID_ZIP, build_pill_dataset
 from pillrag.embed import IMAGENET_MEAN, IMAGENET_STD, mask_bounding_box
 
 TRAIN_RESOLUTION = 384
+
+# Where extract_reference_images() unpacks the ~2,000 is_ref==True
+# training images to real disk (Option A: extract-once, not
+# per-item zip access - see DEVLOG.md for why: PyTorch DataLoader
+# workers sharing one zipfile.ZipFile handle across processes is a
+# known source of subtle corruption, and this is a small, one-time,
+# ~2,000-file cost, not the slow full-13,532-image case Phase 1's
+# "don't persist derived images" decision was actually about).
+#
+# Deliberately scoped to REFERENCE images only (not all 5,728) -
+# proportionate to what Phase 4 training actually touches right now.
+# The eval-set images (3,728 consumer rows) get their own extraction
+# step later, when Phase 4 reaches step 9 (the real eval run) - not
+# done preemptively here.
+EXTRACTED_IMAGE_ROOT = Path(
+    os.environ.get(
+        "PILL_EXTRACTED_IMAGE_ROOT",
+        "/content/drive/MyDrive/pill-rag/data/raw/epillid_extracted",
+    )
+)
 
 MANIFEST_GLOB = os.environ.get(
     "PILL_MASK_MANIFEST_GLOB",
@@ -167,6 +189,78 @@ def load_reference_manifest() -> pd.DataFrame:
     reference_only = merged[merged["is_ref"] == True].copy()  # noqa: E712
 
     return reference_only
+
+
+def extract_reference_images(
+    reference_df: pd.DataFrame,
+    image_root: Path = EXTRACTED_IMAGE_ROOT,
+) -> Path:
+    """Extract the ~2,000 is_ref==True images this dataframe references
+    out of epillid_data.zip and onto real disk, under `image_root`,
+    preserving each row's `full_image_path` as the relative path on
+    disk (e.g. image_root / "ePillID_data/classification_data/
+    fcn_mix_weight/dr_224/xyz.jpg").
+
+    Why this exists (Option A, decided explicitly - see DEVLOG.md):
+    `full_image_path` is a path INSIDE epillid_data.zip, not a real
+    filesystem path - PillPairDataset.__getitem__ calling
+    `Image.open(row["full_image_path"])` directly would fail with
+    FileNotFoundError on the very first training step. Extracting once,
+    up front, avoids per-item zip access - which would require each
+    PyTorch DataLoader worker process to open its own independent
+    zipfile.ZipFile handle to be safe (sharing one handle across
+    worker processes is a known corruption risk), adding real
+    complexity for a data source this small.
+
+    Idempotent / resumable: skips any file that already exists on disk
+    at the expected path with a nonzero size, so re-running this after
+    a Colab session reset (per this project's "assume full reset"
+    rule) only re-extracts what's actually missing, not all ~2,000
+    files every time.
+
+    Args:
+        reference_df: a DataFrame with a `full_image_path` column
+            (zip-relative paths) - typically load_reference_manifest()'s
+            output, or a train_df/val_df slice of it. Only the rows
+            actually present get extracted; this function doesn't
+            assume it's always given the full reference set.
+        image_root: local (or Drive-mounted) directory to extract into.
+            Defaults to EXTRACTED_IMAGE_ROOT (overridable via the
+            PILL_EXTRACTED_IMAGE_ROOT env var, same pattern as
+            data.py's EPILLID_ZIP_PATH / MANIFEST_GLOB env vars).
+
+    Returns:
+        image_root, for convenient chaining
+        (e.g. `root = extract_reference_images(ref_df)`).
+    """
+    image_root.mkdir(parents=True, exist_ok=True)
+
+    zip_relative_paths = reference_df["full_image_path"].unique().tolist()
+
+    already_present = 0
+    newly_extracted = 0
+
+    with zipfile.ZipFile(EPILLID_ZIP) as zf:
+        for zip_relative_path in zip_relative_paths:
+            dest_path = image_root / zip_relative_path
+
+            if dest_path.exists() and dest_path.stat().st_size > 0:
+                already_present += 1
+                continue
+
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(zip_relative_path) as src, open(dest_path, "wb") as dst:
+                dst.write(src.read())
+            newly_extracted += 1
+
+    print(
+        f"extract_reference_images: {newly_extracted} newly extracted, "
+        f"{already_present} already present, "
+        f"{len(zip_relative_paths)} total unique paths requested, "
+        f"root={image_root}"
+    )
+
+    return image_root
 
 
 def decode_rle_mask(rle_size, rle_counts) -> np.ndarray:
@@ -338,11 +432,24 @@ class PillPairDataset(Dataset):
     one fully-excluded pilltype).
     """
 
-    def __init__(self, dataframe: pd.DataFrame, augment: bool):
+    def __init__(
+        self,
+        dataframe: pd.DataFrame,
+        augment: bool,
+        image_root: Path = EXTRACTED_IMAGE_ROOT,
+    ):
         self.dataframe = dataframe.reset_index(drop=True)
         self.transform = (
             build_train_augmentation() if augment else build_eval_augmentation()
         )
+        # image_root: the local directory extract_reference_images()
+        # already unpacked this dataframe's images into. `full_image_path`
+        # itself stays untouched as the zip-relative join key (still
+        # needed to match manifest rows back to build_pill_dataset()'s
+        # df, per load_reference_manifest()'s own join) - the mapping
+        # to a real on-disk path happens ONLY here, at read time, so
+        # nothing upstream needs to know local extraction even exists.
+        self.image_root = image_root
 
     def __len__(self) -> int:
         return len(self.dataframe)
@@ -350,7 +457,8 @@ class PillPairDataset(Dataset):
     def __getitem__(self, idx: int):
         row = self.dataframe.iloc[idx]
 
-        image = Image.open(row["full_image_path"]).convert("RGB")
+        local_path = self.image_root / row["full_image_path"]
+        image = Image.open(local_path).convert("RGB")
         image_array = np.array(image)
 
         mask = decode_rle_mask(row["rle_size"], row["rle_counts"])
@@ -362,6 +470,9 @@ class PillPairDataset(Dataset):
         image_tensor = augmented["image"]
 
         return image_tensor, row["pilltype_id"]
+
+
+if __name__ == "__main__":
     # Quick manual check when run directly: python -m pillrag.train_metric_learning
     ref_df = load_reference_manifest()
     print(f"Reference manifest rows (is_ref==True): {len(ref_df)}")
