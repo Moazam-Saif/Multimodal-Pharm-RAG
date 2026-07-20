@@ -477,6 +477,14 @@ class PillPairDataset(Dataset):
         top, bottom, left, right = mask_bounding_box(mask)
         cropped = image_array[top : bottom + 1, left : right + 1]
 
+        if cropped.size == 0 or 0 in cropped.shape:
+            raise ValueError(
+                f"DIAGNOSTIC idx={idx} full_image_path={row['full_image_path']} "
+                f"image_array.shape={image_array.shape} mask.shape={mask.shape} "
+                f"bbox=(top={top}, bottom={bottom}, left={left}, right={right}) "
+                f"cropped.shape={cropped.shape} rle_size={row['rle_size']}"
+            )
+
         augmented = self.transform(image=cropped)
         image_tensor = augmented["image"]
 
