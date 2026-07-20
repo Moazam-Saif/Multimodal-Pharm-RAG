@@ -160,15 +160,24 @@ TRAIN_VAL_SPLIT_SEED = 42
 N_VAL_PILLTYPES = 200
 
 # Batch size, expressed in PILL TYPES, not images. With exactly 2
-# images/pilltype (verified, see this module's docstring), N=64
-# pilltypes/batch = 128 images/batch - a reasonable default SupCon
-# batch size, chosen for Colab free-tier T4 memory headroom at
-# 384x384 resolution with a ResNet-50 backbone. NOT tuned against a
-# real memory profile yet - this is an assumption, not a measured
-# constraint. If training hits OOM, the first thing to try is
-# lowering this, not the resolution/backbone (those were separate,
-# deliberate Phase 4 decisions - see DEVLOG.md).
-N_PILLTYPES_PER_BATCH = 64
+# images/pilltype (verified, see this module's docstring), N=32
+# pilltypes/batch = 64 images/batch.
+#
+# REVISED from an initial N=64 (128 images/batch) assumption after a
+# REAL OOM on a Colab T4 (14.56 GiB) - confirmed via actual traceback
+# (see DEVLOG.md): a single forward pass on 128 images at 384x384
+# through ResNet-50 already had 13.85 GiB in use before failing to
+# allocate one more 1.12 GiB tensor. Root cause understood, not just
+# patched blindly: activation memory scales roughly with resolution^2,
+# and 384x384 is ~3x the activation footprint of the usual 224x224
+# ResNet-50 is normally benchmarked at - combined with the large
+# batch size, this was the expected consequence flagged when
+# resolution/backbone/objective were all changed at once (see this
+# module's top docstring). Halved as the first, simplest fix per
+# explicit decision - if 32 still OOMs, the next real options are
+# gradient accumulation or mixed precision (fp16/bf16), not blindly
+# halving again.
+N_PILLTYPES_PER_BATCH = 32
 
 # Verified this session (see this module's docstring): the ONLY
 # reference pilltype_id where BOTH images are quality_flag=
@@ -850,9 +859,19 @@ if __name__ == "__main__":
           f"min={projections.norm(dim=1).min().item():.4f}, "
           f"max={projections.norm(dim=1).max().item():.4f}")
 
-    backbone_embeddings = model.backbone_embedding(image_batch)
-    print(f"Backbone embedding shape: {tuple(backbone_embeddings.shape)} "
-          f"(expected: ({image_batch.shape[0]}, {BACKBONE_EMBED_SIZE}))")
+    # backbone_embedding() shape check on a SMALL sub-batch (4 images),
+    # under no_grad - this is just a shape/wiring check, not something
+    # that needs gradients or the full batch, and running it at full
+    # batch size right after the training-path forward pass above
+    # would needlessly double peak memory pressure in this diagnostic
+    # itself (a second full 384x384xN activation graph) - real risk on
+    # a memory-constrained T4, see this module's N_PILLTYPES_PER_BATCH
+    # comment for the OOM this was tuned against.
+    with torch.no_grad():
+        small_backbone_embeddings = model.backbone_embedding(image_batch[:4])
+    print(f"Backbone embedding shape (4-image sub-batch, no_grad): "
+          f"{tuple(small_backbone_embeddings.shape)} "
+          f"(expected: (4, {BACKBONE_EMBED_SIZE}))")
 
     criterion = SupConLoss(temperature=0.07)
     loss = criterion(projections, pilltype_ids)
