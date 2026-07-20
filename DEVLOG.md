@@ -2744,3 +2744,348 @@ Run search_visual() for real against the live dataset (test case:
 round_clean, known_shape="ROUND") and confirm/fix the three unverified
 mechanics above. Then build the eval script over all 3,728 consumer
 images.
+
+## search_visual() run for real - MECHANICALLY WORKS, but 0% accuracy
+
+Ran a 50-image timing/sanity test (real script, real Colab run, NOT a
+crash):
+
+    Total: 513.0s for 50 images (10.261s/image mean)
+    Extrapolated to full 3,728-image eval: ~637.5 minutes
+    top1 accuracy: 0.0%
+    top5 accuracy: 0.0%
+    degraded (fallback segmentation) rate: 8.0%
+    no-shape-available rows in this sample: 2
+    0 rows returned 0 matches - none, good.
+
+This CONFIRMS the three previously-unverified TQL mechanics all
+actually work (WHERE+ORDER BY compose fine in one query, the
+`similarity` column alias is referenceable, DatasetView row access via
+`row["column"]` works) - genuinely useful, real progress. But 0%
+top-1/top-5 across 50 real queries, with zero zero-match cases (i.e.
+it's confidently returning wrong answers every time, not failing to
+find anything) is a real red flag, not noise.
+
+Also observed on every single query: a wall of repeated
+`WARNING:deeplake.storage.s3:[S3] Failed to get bucket region ...
+INVALID_ACCESS_KEY_ID snark-hub` warnings. Not yet root-caused or
+connected to the accuracy problem - flagged as a SEPARATE open thread,
+not dismissed. Whether this is cosmetic (some internal Deep Lake
+region-lookup fallback path that doesn't actually block the real
+auth'd query) or masking a real issue has NOT been checked. Whoever
+picks this up: don't assume it's harmless just because the query
+returns real results - it hasn't been investigated.
+
+### Diagnostic trail - real evidence, ruled out one at a time (rule #4)
+
+Investigated via single-image debug (NOT aggregate stats first - per
+rule #4, looked at one real case in depth before theorizing):
+
+1. **Query mechanics** - RULED OUT. Debug call on one consumer image
+   (`dc_224/1812.jpg`, real pilltype_id `50111-0434-01_F22FF97F`,
+   known_shape="ROUND") returned 5 matches, all correctly shape-
+   filtered (all ROUND, shape_matched=True), similarities in a
+   plausible 0.9493-0.9580 band, no crash. Just none of the 5 was the
+   real answer.
+
+2. **Shape-filter hiding the true match** - RULED OUT. Checked whether
+   50111-0434-01_F22FF97F's OWN shape label might not be "ROUND"
+   (which would mean our own hard filter excluded it legitimately, not
+   a bug). Confirmed: shape='ROUND' in both the source df AND a direct
+   Deep Lake index lookup - it was NOT filtered out, it just didn't
+   score highest.
+
+3. **Embedding-pipeline drift between index-build-time and query-time**
+   - RULED OUT, and worth remembering as a real methodology win: computed
+   embed_image() FRESH, right now, on the true reference image, and
+   compared byte values against what's actually STORED in Deep Lake for
+   that same row. Result: cosine similarity 1.000000, raw values
+   identical to 5 decimal places. The batch-embed job and today's code
+   produce bit-identical output - the index is not stale, embed.py
+   hasn't drifted since the batch job ran.
+
+4. **Direct cosine similarity check (bypassing the TQL query
+   entirely)**: computed embed_query_image's embedding for the debug
+   query, computed embed_image() on the TRUE reference image directly
+   via numpy (not through Deep Lake at all), got: manual cosine
+   similarity (query vs TRUE ref) = 0.9317. This is LOWER than several
+   WRONG matches Deep Lake returned (0.9493-0.9580). Confirms this is
+   NOT a query bug - Deep Lake correctly returned its highest-
+   similarity rows; the true match genuinely isn't the closest
+   neighbor in embedding space.
+
+5. **Shape/color breakdown of the full 50-image sample** - this is the
+   result that actually redirected the investigation. Broke down the
+   50-image sample's 0% accuracy by shape (CAPSULE/OVAL/ROUND) and by
+   color (BLUE/BROWN/GREEN/ORANGE/PINK/RED/WHITE/YELLOW/etc) - EVERY
+   SINGLE category showed 0.0% accuracy, including highly distinctive
+   colors like BLUE/RED/YELLOW, not just white/round pills. This
+   WEAKENS (doesn't confirm) the initial "white round pills are hard to
+   tell apart" framing - a discriminative-power problem concentrated in
+   visually-similar pills would show better accuracy on distinctive
+   colors. Uniform failure across every category points to something
+   more structural: the embedding space isn't discriminative for ANY
+   pill-vs-pill comparison at this granularity, not just similar-
+   looking ones.
+
+### Conclusion from the diagnostic trail
+
+The embedding model itself is the bottleneck. A zero-shot ImageNet-
+pretrained ResNet-18 (embed.py's current _build_feature_extractor())
+was never trained to distinguish fine-grained pharmaceutical detail
+(score lines, rim geometry, subtle indentations, exact shade) from any
+pill against any other pill - it happens to produce SOME usable notion
+of visual similarity as a side effect of ImageNet classification (that's
+why results aren't random - they're all clustered in a real "these are
+plausible pills" 0.93-0.96 band), but nothing in its training ever
+taught it to care about the specific features that actually distinguish
+one pill from another.
+
+Cross-checked against external research (web search): this dataset
+IS the ePillID paper's own published benchmark. Their baseline used
+ResNet50, not ResNet18. Their actual best-performing approach was a
+multi-head METRIC-LEARNING model with a bilinear transformation layer,
+trained specifically on pill data with a metric-learning loss (not a
+generic ImageNet classifier) - and even that trained model's own error
+analysis found it still fails to distinguish particularly confusing
+classes, so 0% is a larger gap than what a properly-trained model
+would show, but "some real, trained signal" is categorically different
+from "this raw feature extractor was never taught to care." Checked
+the paper's GitHub repo directly (github.com/usuyama/ePillID-benchmark)
+- they publish `train_cv.py` (training code), NOT pretrained weights.
+This means using their result requires actually training a model
+ourselves, not downloading a checkpoint.
+
+## User-provided design report: Pill_Retrieval_Design_Report.docx
+
+User uploaded a report independently proposing the same root cause
+(generic ImageNet features lack fine-grained localized detail) with a
+near-identical example case (two round white pills at ~0.95 cosine
+similarity - matches our own 0.93-0.96 finding closely). Report's
+recommended plan, in priority order: (1) metric learning (Triplet/
+Contrastive/SupCon loss) as the primary fix, (2) higher input
+resolution, (3) metadata pre-filtering before vector search (we
+already have a version of this - the shape hard filter), (4) region-
+based embeddings + Grad-CAM verification as a further step, (5)
+backbone swap (DINOv2/SigLIP) - EXPLICITLY DEPRIORITIZED, the report
+says only try this AFTER the training objective is fixed, not before.
+
+Confirmed this is a reference/inspiration document informing our own
+decision, NOT a literal spec to follow verbatim - user made real,
+independent choices below that diverge from the report's own priority
+order in places.
+
+## Phase 4 kickoff: metric-learning fine-tuning - real decisions made
+
+User's chosen scope: metric learning (SupCon loss) + Grad-CAM
+verification. Region-based embeddings explicitly PARKED, not built now
+- decided to sequence it as: train with metric learning -> verify with
+Grad-CAM -> ONLY THEN decide, based on real Grad-CAM evidence, whether
+region-based embedding is actually needed. Grad-CAM is a diagnostic
+tool (inspects an already-trained model after the fact, produces a
+heatmap, changes nothing about the model/pipeline) - genuinely
+different from region-based embeddings (an architecture change:
+multiple sub-region crops -> multiple embeddings per pill, instead of
+one). Conflating these two was a real point of confusion this session,
+worth remembering: Grad-CAM is how you'd DECIDE whether region-based
+embedding is worth building, not a parallel/simultaneous step.
+
+**Real decision, diverges from the report's stated priority order**:
+user chose to do backbone swap (ResNet-18 -> ResNet-50) AND resolution
+bump (224x224 -> 384x384) AT THE SAME TIME as the metric-learning
+objective change, rather than isolating the objective change first as
+the report recommends. Explicit, acknowledged consequence: if results
+improve, we won't cleanly know which of the three changes
+(objective/backbone/resolution) drove it. Accepted tradeoff, not an
+oversight.
+
+**Real decision - training data scope**: train ONLY on the 2,000
+reference images (is_ref==True) - the same set already indexed in
+Deep Lake. Consumer images (is_ref==False, 3,728 rows) are explicitly
+reserved as the FINAL EVAL set and must NOT be touched during training
+or used for validation-during-training - doing so would leak
+information into checkpoint selection and make the eventual real
+accuracy number not truly held-out. This was a real point worth
+getting right: "validation split" (used DURING training to pick
+checkpoints/monitor progress) and "final eval" (the one real accuracy
+number, touched once, after training is fully done) are different
+roles and were initially at risk of being conflated.
+
+**Real decision - validation split**: 800/200 split of the 1,000
+reference PILL TYPES (not images) - every image of a given pilltype_id
+stays entirely within one split, so no image of a pill type used for
+training validation ever leaks into training, or vice versa.
+
+**Real decision - masks for training**: reuse Phase 2's ALREADY-
+COMPUTED manifest masks (data/masks/manifest_chunk_000..011.parquet),
+NOT re-segment images fresh during training. Matches what the live
+Deep Lake index was actually built from; avoids re-running FastSAM
+5,728 times per epoch.
+
+### Manifest RLE format - VERIFIED this session, not assumed
+
+Checked the actual manifest schema via a fresh Colab session (previous
+session had reset, df/model no longer in memory) rather than guessing:
+
+    Columns: ['full_image_path', 'pilltype_id', 'label', 'shape',
+               'method', 'quality_flag', 'rle_size', 'rle_counts']
+    rle_size:   [1024, 1024]
+    rle_counts: 'i]P5c2Vm0`0B=C;F;D;F:F9F9H8I5J7J5K5K5K6J5K6J5L...' (string)
+
+This is standard pycocotools/COCO RLE format. Ran a direct decode test
+before building anything around this assumption:
+
+    Decoded mask shape: (1024, 1024), dtype: uint8
+    Mask sum (True pixel count): 352713
+
+Decoded cleanly on the FIRST try via `pycocotools.mask.decode({"size":
+rle_size, "counts": rle_counts})` - no bytes-encoding workaround
+needed (some RLE dicts require counts.encode("utf-8") first; this one
+didn't). Confirmed with real evidence before writing the Dataset
+loader around it, per rule #3.
+
+NOTE: the manifest does NOT have an is_ref column - joined back to
+build_pill_dataset()'s df on full_image_path to recover it. Join
+verified clean: 0 rows where the join failed (is_ref came back NaN).
+
+### Balanced batch sampler - why plain random shuffling was rejected
+
+With only ~2 images per pill type (1,000 pill types x 2 = 2,000
+reference images), SupCon needs real positive pairs (same pilltype_id)
+WITHIN a batch to have any "pull together" signal at all. Plain random
+shuffling would leave most batches with ZERO true positive pairs by
+chance, wasting that half of the loss on most training steps -
+gradient would only ever push things apart, never pull anything
+together. Decided: BALANCED sampler - each batch draws N distinct pill
+types and includes BOTH of that type's images, guaranteeing a real
+positive pair for every image, every batch, every step.
+
+**Epoch definition**: one epoch = every training pill type appears in
+EXACTLY ONE batch (shuffle the training pilltype_ids, chop into
+consecutive groups of N) - NOT a fixed-batches-per-epoch/sample-with-
+replacement scheme. Chosen because the dataset is small, fixed-size,
+and perfectly balanced (every class has exactly 2 images) - no real
+benefit to the more complex alternative here.
+
+### Data quality check - VERIFIED with a real script, not assumed
+
+Ran a standalone verification script (not just proceeded on the "2
+images per pill type" assumption) - real output:
+
+    Total manifest rows: 5728
+    Rows where is_ref join failed (NaN): 0
+    Reference rows (is_ref==True): 2000
+    Unique pilltype_ids among reference rows: 1000
+    Per-pilltype_id image count distribution: {2: 1000}  <- ALL 1000
+        pilltype_ids have EXACTLY 2 images, no exceptions
+    quality_flag breakdown (reference only): ok=1996, fallback_full_image=4
+    Pilltypes with 0 reference images in manifest: 0
+
+Then specifically checked whether any pilltype_id has BOTH its 2
+images as fallback_full_image (zero real pill-crop signal, vs. just
+one degraded side of an otherwise-real pair) - found EXACTLY ONE:
+**00093-1003-01_B326D9D6** (both dr_224 SB/SF images are
+fallback_full_image). The other 2 fallback pilltypes each have one
+real `ok` sibling image, so they're a materially milder situation.
+
+**Decision**: EXCLUDE 00093-1003-01_B326D9D6 from the train/val split
+(via EXCLUDED_ZERO_SIGNAL_PILLTYPES in train_metric_learning.py) -
+training a SupCon positive pair from two background-heavy full-image
+crops would teach the model "these are the same class" based on
+background/lighting similarity, not real pill signal, which is
+actively harmful, not neutral noise. This pilltype_id is NOT removed
+from load_reference_manifest()'s output (still visible/countable
+there) and is NOT removed from the live Deep Lake index or eventual
+eval set - only excluded at the train/val split stage. The other 3
+fallback rows are kept as-is (accepted as negligible, ~0.15% of
+training data, each still has real signal from its sibling image).
+
+## src/pillrag/train_metric_learning.py - STAGE 1 WRITTEN, NOT YET RUN
+
+New module. Stage 1 only (data loading + split) - NOT the Dataset
+class, augmentation, balanced sampler, model, loss, or training loop
+yet. Contains:
+
+  - `load_reference_manifest()` - loads all 12 manifest chunks, joins
+    to build_pill_dataset()'s df on full_image_path to recover is_ref/
+    is_front/medicine_name/color, filters to is_ref==True.
+  - `decode_rle_mask(rle_size, rle_counts)` - pycocotools RLE decode,
+    confirmed working per the verification above.
+  - `make_train_val_split(reference_df, n_val_pilltypes=200, seed=42)`
+    - excludes EXCLUDED_ZERO_SIGNAL_PILLTYPES first, then splits the
+    remaining ~999 pilltype_ids into ~799 train / 200 val, by
+    pilltype_id (not image).
+
+**NOT YET RUN** - pushed to repo but no confirmed execution yet.
+Expected output when run: 999 eligible pilltypes (1000 - 1 excluded),
+799 train / 200 val pilltypes, 0 overlap. Whoever picks this up: run
+this BEFORE building anything further on top of it (Dataset class,
+sampler, model) - don't assume the split math is right just because
+the code looks right, per rule #3.
+
+## Immediate next step (current, as of this entry)
+
+1. Run train_metric_learning.py's __main__ block (or import + call
+   load_reference_manifest() / make_train_val_split() directly) and
+   confirm the expected counts above.
+2. Build the Dataset class: RLE-decode mask -> crop to bbox (reuse
+   mask_bounding_box from embed.py) -> apply augmentation (rotation
+   full 360°, h/v flip, MILD brightness/contrast/crop jitter - blur
+   and color jitter SKIPPED or minimal, see reasoning below) -> resize
+   to 384x384.
+3. Build the balanced batch sampler (Option 1 epoch semantics, see
+   above).
+4. Model: ResNet-50 backbone (ImageNet-pretrained) + projection head
+   for SupCon. Two-phase training: freeze backbone + train head first,
+   then unfreeze layer4 at a smaller LR (standard strategy to avoid
+   catastrophic forgetting - a randomly-initialized head's large
+   initial gradients could otherwise wreck ResNet's already-useful
+   pretrained features if the whole network is unfrozen from step one).
+5. SupCon loss implementation.
+6. Full training loop, checkpoint saving, loss curve logging.
+7. AFTER training: Grad-CAM verification on the trained model.
+8. ONLY AFTER Grad-CAM: decide whether region-based embeddings are
+   actually needed, based on what the heatmaps show (diffuse/generic
+   attention -> yes; already localized on rim/imprint area -> probably
+   not needed).
+9. Re-embed the 2,000 reference images with the NEW trained model,
+   rebuild/replace the Deep Lake index (the CURRENT
+   pillrag-reference-embeddings dataset was built with the OLD
+   ResNet-18 embeddings - will need a new dataset or a full
+   re-upload, not an in-place patch, since embedding dimension may
+   also change depending on the projection head's output size).
+10. ONLY THEN: run the real, one-time full eval on all 3,728 consumer
+    images (untouched until now) to get the real, honest accuracy
+    number.
+
+## Augmentation choices for training - reasoning captured
+
+Given the failure mode is confusion over SUBTLE, fine-grained features
+(score lines, rim geometry, indentations) - explicitly reasoned about
+which augmentations help vs. actively erase the signal being trained
+for, rather than applying a generic augmentation preset:
+
+SAFE (real photo-taking variation, don't destroy fine detail):
+  - Random rotation, full 360° - pills have no "upright", teaches
+    genuine rotation-invariance without touching detail at all.
+  - Horizontal/vertical flip - similarly free signal.
+  - MILD brightness/contrast jitter - real consumer photos vary in
+    lighting; needs to stay mild since surface-shading cues ARE part
+    of the real signal (indentation/texture visibility depends on how
+    light falls on the surface).
+  - Slight scale/crop jitter - narrow range only, since the pipeline
+    already crops tightly to the segmentation mask's bbox; aggressive
+    jitter risks cropping out the rim/edge detail that matters.
+
+RISKY (rejected or heavily limited - would erase the actual signal):
+  - Blur - SKIPPED or very mild/low-probability only. Score lines and
+    rim geometry are fine, thin detail - any meaningful blur risks
+    smoothing away exactly the feature being trained for.
+  - Heavy color jitter / hue shifts - color is often a REAL,
+    load-bearing distinguishing feature (Pillbox's own metadata tracks
+    color as identifying) - aggressive jitter risks teaching the model
+    to ignore genuinely informative signal.
+  - Aggressive random erasing/cutout - real risk of blanking out the
+    one imprint/score-line region that matters, with no guarantee
+    anything equally informative remains in a small pill crop.
+

@@ -99,9 +99,17 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+import albumentations as A
+import cv2
+from albumentations.pytorch import ToTensorV2
+from PIL import Image
 from pycocotools import mask as maskUtils
+from torch.utils.data import Dataset
 
 from pillrag.data import build_pill_dataset
+from pillrag.embed import IMAGENET_MEAN, IMAGENET_STD, mask_bounding_box
+
+TRAIN_RESOLUTION = 384
 
 MANIFEST_GLOB = os.environ.get(
     "PILL_MASK_MANIFEST_GLOB",
@@ -231,7 +239,129 @@ def make_train_val_split(
     )
 
 
-if __name__ == "__main__":
+def build_train_augmentation() -> A.Compose:
+    """The TRAIN-only augmentation pipeline.
+
+    Deliberately NOT a generic augmentation preset - reasoned through
+    per-transform against this task's specific failure mode (confusion
+    between visually similar pills over SUBTLE features: score lines,
+    rim geometry, indentations). See this module's docstring for the
+    full safe-vs-risky reasoning. Summary:
+
+    SAFE, used at meaningful strength:
+      - Full 360° rotation - pills have no "upright"; teaches genuine
+        rotation-invariance without touching fine detail at all.
+      - Horizontal + vertical flip - same reasoning.
+      - MILD brightness/contrast jitter - real consumer photos vary in
+        lighting, but pushed too far this would wash out the surface-
+        shading cues that ARE part of the real signal (how light
+        catches an indentation/score line).
+      - Slight random crop / scale jitter - kept NARROW, since the
+        pipeline already crops tightly to the segmentation mask's
+        bbox; aggressive jitter risks cropping out real rim/edge
+        detail that matters.
+
+    AVOIDED or minimal:
+      - Blur - SKIPPED entirely. Score lines and rim geometry are
+        fine, thin detail; any meaningful blur risks smoothing away
+        exactly the feature being trained to detect.
+      - Heavy color/hue jitter - SKIPPED. Color is often a REAL,
+        load-bearing distinguishing feature here (Pillbox's own
+        metadata tracks color as identifying), not a nuisance
+        variable to be jittered away.
+      - Random erasing/cutout - SKIPPED. Real risk of blanking the one
+        informative region (imprint/score line) in an already-small
+        crop, with no guarantee anything equally informative remains.
+    """
+    return A.Compose([
+        A.LongestMaxSize(max_size=TRAIN_RESOLUTION),
+        A.PadIfNeeded(
+            min_height=TRAIN_RESOLUTION,
+            min_width=TRAIN_RESOLUTION,
+            border_mode=cv2.BORDER_CONSTANT,
+            value=(255, 255, 255),
+        ),
+        A.Rotate(limit=180, border_mode=cv2.BORDER_CONSTANT, value=(255, 255, 255), p=0.9),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomBrightnessContrast(
+            brightness_limit=0.15, contrast_limit=0.15, p=0.5
+        ),
+        A.RandomResizedCrop(
+            size=(TRAIN_RESOLUTION, TRAIN_RESOLUTION),
+            scale=(0.85, 1.0),  # narrow - don't crop out real edge/rim detail
+            ratio=(0.95, 1.05),
+            p=0.5,
+        ),
+        A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ToTensorV2(),
+    ])
+
+
+def build_eval_augmentation() -> A.Compose:
+    """The VAL/eval pipeline - NO augmentation, just deterministic
+    resize + pad + normalize. Used for the held-out validation split
+    (and later, for the real consumer-image eval and for building the
+    Deep Lake index) so results are reproducible and not inflated/
+    deflated by random augmentation.
+    """
+    return A.Compose([
+        A.LongestMaxSize(max_size=TRAIN_RESOLUTION),
+        A.PadIfNeeded(
+            min_height=TRAIN_RESOLUTION,
+            min_width=TRAIN_RESOLUTION,
+            border_mode=cv2.BORDER_CONSTANT,
+            value=(255, 255, 255),
+        ),
+        A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ToTensorV2(),
+    ])
+
+
+class PillPairDataset(Dataset):
+    """A single reference image + its resolved mask, cropped and
+    (optionally) augmented, ready for the model.
+
+    Each item is ONE image, not a pre-assembled pair/triplet - pairing
+    happens at the BATCH level via the balanced sampler (see
+    PillBalancedBatchSampler below), not here. This dataset's only job
+    is: given a manifest row, produce (image_tensor, pilltype_id).
+
+    Cropping: reuses embed.py's mask_bounding_box() - SAME tight-bbox-
+    crop-no-internal-masking convention already established for
+    embed_image(), for consistency between how the live index was
+    built and how this training data is prepared. Real background
+    pixels inside the bbox are kept as-is, same known consequence
+    documented in embed.py (worse for loose/fallback masks - relevant
+    here for the 3 remaining fallback_full_image rows in the training
+    set, see this module's docstring for why those were kept vs. the
+    one fully-excluded pilltype).
+    """
+
+    def __init__(self, dataframe: pd.DataFrame, augment: bool):
+        self.dataframe = dataframe.reset_index(drop=True)
+        self.transform = (
+            build_train_augmentation() if augment else build_eval_augmentation()
+        )
+
+    def __len__(self) -> int:
+        return len(self.dataframe)
+
+    def __getitem__(self, idx: int):
+        row = self.dataframe.iloc[idx]
+
+        image = Image.open(row["full_image_path"]).convert("RGB")
+        image_array = np.array(image)
+
+        mask = decode_rle_mask(row["rle_size"], row["rle_counts"])
+
+        top, bottom, left, right = mask_bounding_box(mask)
+        cropped = image_array[top : bottom + 1, left : right + 1]
+
+        augmented = self.transform(image=cropped)
+        image_tensor = augmented["image"]
+
+        return image_tensor, row["pilltype_id"]
     # Quick manual check when run directly: python -m pillrag.train_metric_learning
     ref_df = load_reference_manifest()
     print(f"Reference manifest rows (is_ref==True): {len(ref_df)}")

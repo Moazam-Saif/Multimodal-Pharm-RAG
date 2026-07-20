@@ -71,7 +71,7 @@ tracked follow-up.** Entry point: `pillrag.segment.resolve_pill_mask
   UNRECONCILED - two investigations point opposite ways. Explicit
   decision: proceed anyway, accepted as unquantified risk.
 
-## Phase 3 (embedding + vector search): index is LIVE, query side WRITTEN but NOT runtime-verified
+## Phase 3 (embedding + vector search): index LIVE, search_visual WORKS MECHANICALLY but has 0% accuracy - root cause diagnosed, fix in progress (Phase 4)
 
 **Scope decision**: vector index = reference images ONLY
 (`is_ref==True`, 2,000 rows / 1,000 pill types). Consumer images
@@ -110,54 +110,146 @@ similarity-search index), pilltype_id/label/drug_name/color/shape
 session (Colab Secrets recommended) - NEVER hardcode a token in any
 script.
 
-**`src/pillrag/visual_search.py` - WRITTEN, partially verified:**
-- [x] `segment_query_image(image_path, known_shape, fastsam_model)` -
-      VERIFIED. Live-query segmentation wrapper around
-      `resolve_pill_mask` + `run_fastsam`. Never returns
-      `final_mask=None` - falls back to an all-True full-image mask
-      (flagged via `degraded=True`) if segmentation genuinely fails.
-      Run in Colab against the `round_clean` test case, exact match to
-      the known-good manual `resolve_pill_mask` result: method=single,
-      degraded=False, mask shape (1024,1024), sum=618772.
-- [x] `embed_query_image(image_path, known_shape, fastsam_model)` -
-      VERIFIED. Thin wrapper: segment_query_image -> embed_image.
-      Run in Colab against `round_clean`: method=single, degraded=
-      False, embedding.shape=(512,), dtype=float32 - exact match to
-      expected.
-- [ ] `search_visual(image_path, known_shape, fastsam_model, top_k,
-      dataset_path)` - WRITTEN, NOT YET RUN. Segments, embeds, queries
-      the live Deep Lake dataset via `deeplake.query()` (TQL, embedding
-      formatted as a comma-joined `ARRAY[...]` literal - confirmed
-      against current deeplake docs, not yet run against the real
-      dataset), returns shape-filtered/similarity-ranked matches.
-      **This is the actual next thing to do** - run it once against a
-      known test case (e.g. round_clean, known_shape="ROUND") before
-      trusting it. See DEVLOG.md's "NOT YET VERIFIED" list for the
-      exact open mechanics (WHERE+ORDER BY composition in one TQL
-      query, the `similarity` column alias, DatasetView row-access
-      pattern, single-quote handling).
-- [ ] **Eval script**: run all 3,728 consumer images through
-      `search_visual`, check retrieval accuracy against known
-      `pilltype_id`. Blocked on `search_visual` being runtime-verified
-      first. The real end-to-end test of Phase 2+3.
+**`src/pillrag/visual_search.py` - FULLY BUILT AND MECHANICALLY VERIFIED:**
+- [x] `segment_query_image()` - VERIFIED (round_clean test case, exact
+      match to known-good resolve_pill_mask result).
+- [x] `embed_query_image()` - VERIFIED (round_clean test case, exact
+      match to expected embedding shape/dtype).
+- [x] `search_visual()` - VERIFIED MECHANICALLY WORKING: ran a real
+      50-image timing test against the live Deep Lake dataset. TQL
+      query composes correctly (WHERE + ORDER BY COSINE_SIMILARITY in
+      one query), the `similarity` column alias works, DatasetView row
+      access works, shape filtering works correctly (spot-checked).
+      **BUT: 0% top-1 and 0% top-5 accuracy across all 50 real
+      queries** - uniform failure across every shape AND every color
+      category (not concentrated in similar-looking pills). This is a
+      REAL, DIAGNOSED problem, not a bug in this code - see below.
 
-**Product decision this session - known_shape is now REQUIRED**, not
-optional, across all three functions above. The user always selects
-their pill's shape from a dropdown before taking the photo - this
-isn't an inferred value, so it doesn't reopen the "don't infer shape
-at query time" concern the Hough fallback's scope note was originally
-about (see the new "don't re-litigate" entry below).
+**ROOT CAUSE, confirmed via a real diagnostic trail (full evidence
+chain in DEVLOG.md - query mechanics, shape filter, and embedding-
+pipeline drift were each individually ruled out with real evidence
+before landing here): the embedding model itself is not
+discriminative enough for this task.** embed.py's ResNet-18 is a
+zero-shot ImageNet-pretrained feature extractor - it was never trained
+to distinguish fine-grained pharmaceutical detail (score lines, rim
+geometry, subtle indentations) between one pill and another. It
+produces a real, non-random notion of visual similarity (results
+aren't garbage - a true match's cosine similarity was 0.93, in the
+same 0.93-0.96 band as the wrong matches) but nowhere NEAR
+discriminative enough to reliably tell pills apart. Confirmed this
+dataset is the ePillID paper's own published benchmark - their best
+approach was a metric-learning model TRAINED specifically on pill
+data, not a generic pretrained classifier.
 
-**Product decision this session - shape filtering in search_visual is
-a HARD filter, not a soft boost.** Only rows where `shape ==
-known_shape OR shape == ''` (empty string = Phase 1's missing-metadata
-sentinel) are eligible to appear in results at all - a row with a
-KNOWN, DIFFERENT shape is excluded entirely, never just ranked lower.
-Two other options (no filter, soft similarity-score boost for matching
-shape) were considered and rejected once the actual product
-requirement was confirmed. Known, accepted residual risk: this fixes
-the missing-label case (~3.2% of rows) but not a genuinely WRONG shape
-label - see DEVLOG.md for the full reasoning trail.
+**Also observed, NOT yet investigated**: every single query during
+the 50-image test printed a repeated
+`WARNING:deeplake.storage.s3:...INVALID_ACCESS_KEY_ID` warning. Real
+queries still returned correct-shaped results despite this, so it may
+be cosmetic - but this has NOT been root-caused or connected to (or
+ruled out as connected to) the accuracy problem. Don't assume it's
+harmless without checking.
+
+**Eval script (all 3,728 consumer images): NOT YET BUILT, and
+DELIBERATELY BLOCKED until Phase 4's retrained model exists.** Running
+the full eval now, against the current ResNet-18 embeddings, would
+just be a slower, more expensive way of confirming the same 0%
+accuracy already seen on the 50-image sample - not a useful next step.
+The consumer images (is_ref==False, 3,728 rows) must stay COMPLETELY
+UNTOUCHED until Phase 4 training is fully done - see Phase 4 section
+below for why (they're reserved as the one real, held-out eval set).
+
+## Phase 4 (metric-learning fine-tuning): IN PROGRESS - stage 1 of training script written, NOT YET RUN
+
+**Goal**: replace the current zero-shot ResNet-18 embedding model with
+one trained via metric learning (Supervised Contrastive Loss), so the
+embedding space is directly optimized for "same pill close together,
+different pill far apart" - see DEVLOG.md's diagnostic trail for the
+full evidence chain that led here.
+
+**Scope, as explicitly decided this session:**
+  - Metric learning (SupCon loss) + Grad-CAM verification afterward.
+  - Region-based embeddings explicitly PARKED - decide whether it's
+    needed based on what Grad-CAM shows AFTER training, not built
+    preemptively alongside it.
+  - Backbone: ResNet-50 (up from ResNet-18) - matches the ePillID
+    paper's own baseline.
+  - Resolution: 384x384 (up from 224x224).
+  - **NOTE**: both the backbone and resolution changes were called out
+    in the user's own uploaded design report as steps to defer until
+    AFTER the training-objective change was validated in isolation -
+    explicit user decision to do all three at once instead. Known,
+    accepted consequence: if results improve, we won't cleanly know
+    which of the three changes actually drove it.
+
+**Data scope decisions (important - don't re-litigate without reason):**
+  - Train ONLY on the 2,000 reference images (is_ref==True) - the same
+    set already indexed in Deep Lake.
+  - Consumer images (is_ref==False, 3,728 rows) are the FINAL EVAL
+    set and must NOT be touched during training OR used for
+    validation-during-training (that would leak info into checkpoint
+    selection and make the eventual real accuracy number not truly
+    held-out).
+  - Validation-during-training uses a HELD-OUT SPLIT OF REFERENCE
+    PILL TYPES instead: 800/200 pilltype-level split (not image-level -
+    both images of a pill type always stay in the same split).
+  - Masks: reused directly from Phase 2's existing manifest parquet
+    files (data/masks/manifest_chunk_000..011.parquet) via RLE decode -
+    NOT re-segmented. Confirmed via real decode test this session:
+    standard pycocotools COCO RLE (rle_size=[H,W], rle_counts=string
+    column), decodes cleanly, no bytes-encoding workaround needed.
+  - Data quality, VERIFIED via a real script (not assumed): all 1,000
+    reference pilltype_ids have exactly 2 images (no exceptions). 4/2000
+    rows have quality_flag=fallback_full_image; of those, exactly ONE
+    pilltype_id (00093-1003-01_B326D9D6) has BOTH images as fallback
+    (zero real pill-crop signal) - this one is EXCLUDED from the
+    train/val split (see EXCLUDED_ZERO_SIGNAL_PILLTYPES in
+    train_metric_learning.py). The other 3 fallback rows each have a
+    real `ok` sibling image and are kept as-is.
+  - Batch construction: a BALANCED sampler, not plain random shuffling
+    - each batch draws N distinct pill types and includes BOTH images
+    of each, guaranteeing every image has a real positive pair in-
+    batch (SupCon needs this; with only ~2 images/class, random
+    batches would mostly have zero true positive pairs, wasting the
+    "pull together" half of the loss). One epoch = every training
+    pill type appears in exactly one batch (shuffle pilltype_ids,
+    chop into groups of N) - not a fixed-batches/sample-with-
+    replacement scheme.
+  - Augmentation, deliberately NOT a generic preset (reasoning in
+    DEVLOG.md) - SAFE: full 360° rotation, h/v flip, MILD brightness/
+    contrast/crop jitter. AVOIDED or minimal: blur (would smear score
+    lines/rim detail), heavy color jitter (color is a real
+    distinguishing feature here, not noise), aggressive cutout (risks
+    blanking the one informative region in a small crop).
+
+**`src/pillrag/train_metric_learning.py` - STAGE 1 ONLY, NOT YET RUN.**
+Contains `load_reference_manifest()`, `decode_rle_mask()`,
+`make_train_val_split()` - data loading and the train/val split only.
+Does NOT yet contain: the Dataset class (augmentation + crop + resize),
+the balanced batch sampler, the model (ResNet-50 + projection head),
+the SupCon loss, or the training loop itself. **Run this first and
+confirm the expected counts (999 eligible pilltypes, 799 train / 200
+val, 0 overlap) before building anything further on top of it.**
+
+**Immediate next steps, in order:**
+1. Run train_metric_learning.py's data-loading stage, confirm counts.
+2. Build the Dataset class (RLE decode -> bbox crop via
+   mask_bounding_box -> augmentation -> resize to 384x384).
+3. Build the balanced batch sampler.
+4. Build the model (ResNet-50 + SupCon projection head) and the
+   two-phase training loop (freeze backbone + train head first, then
+   unfreeze layer4 at a lower LR - standard technique to avoid
+   catastrophic forgetting of ResNet's pretrained features).
+5. Implement SupCon loss, train, save checkpoints + loss curves.
+6. Run Grad-CAM on the trained model to verify what it's actually
+   attending to.
+7. ONLY THEN decide whether region-based embeddings are needed, based
+   on real Grad-CAM evidence (diffuse attention -> yes; already
+   localized on rim/imprint -> probably not).
+8. Re-embed the 2,000 reference images with the new model, rebuild
+   the Deep Lake index (embedding dimension may differ from 512 -
+   this will likely need a NEW dataset, not an in-place patch).
+9. ONLY THEN run the real, one-time eval on all 3,728 consumer images
+   (untouched until now) for the honest final accuracy number.
 
 ## SAM3 follow-up (tracked, not blocking)
 
@@ -181,10 +273,10 @@ improvement, not an index-integrity fix.
 
 ## Immediate next step
 
-**Build `search_visual`** (segment -> embed -> query Deep Lake ->
-return match), then the eval script that runs all 3,728 consumer
-images through it and reports real retrieval accuracy. That's the
-actual end-to-end proof this system works.
+See "Phase 4" section above for the current, real next steps. (This
+section previously said "build search_visual" - that's done; the
+project has moved to fixing the accuracy problem search_visual
+revealed.)
 
 ## Quick reference - what NOT to re-litigate
 
@@ -229,6 +321,32 @@ if you want it):
 - Background handling in embed_image: tight bbox crop, no internal
   pixel masking - explicit user decision, known consequence for loose
   masks documented in embed.py's docstring
+- **Phase 3's ResNet-18 embeddings give 0% top-1/top-5 accuracy** -
+  confirmed via a real, multi-step diagnostic trail (query mechanics,
+  shape filter, embedding-pipeline drift ALL individually ruled out
+  with real evidence) - root cause is the embedding model itself, not
+  a bug in visual_search.py. Don't re-investigate query/filter/drift
+  again without new evidence - see DEVLOG.md's full trail if you want
+  to double-check the reasoning.
+- **Phase 4 scope**: metric learning (SupCon) + Grad-CAM verification
+  ONLY. Region-based embeddings explicitly PARKED - decide AFTER
+  Grad-CAM results, don't build preemptively.
+- **Phase 4 data scope**: train ONLY on the 2,000 reference images.
+  Consumer images (is_ref==False) are the FINAL EVAL set - NEVER use
+  them for training OR validation-during-training, even though it
+  might seem convenient. This is intentional, not an oversight -
+  don't "helpfully" add them to a validation loop.
+- **Phase 4 backbone/resolution decision diverges from the design
+  report's own recommended priority order** (report says isolate the
+  training-objective change first, defer backbone/resolution) - user
+  explicitly chose to change all three at once. This was a deliberate,
+  informed tradeoff, not something to "fix" by reverting to the
+  report's order without asking.
+- **00093-1003-01_B326D9D6 is excluded from Phase 4 training** (both
+  its reference images are quality_flag=fallback_full_image, zero real
+  signal) - but NOT removed from the manifest load, live Deep Lake
+  index, or eventual eval set. Don't re-add it to training without
+  re-checking its mask quality first.
 - Colab session resets: ALWAYS assume full reset after reload OR
   restart - re-mount Drive, reinstall packages, re-set env vars,
   re-import everything, rebuild df/model/ZIP_PATH. Use
@@ -256,8 +374,25 @@ if you want it):
 - `src/pillrag/embed.py` - Phase 3, `embed_image()`, `mask_bounding_box()`, `run_fastsam()`
 - `src/pillrag/visual_search.py` - Phase 3, live query path:
   `segment_query_image()` (verified), `embed_query_image()`
-  (verified), `search_visual()` (written, NOT yet runtime-verified -
-  see Phase 3 section above)
+  (verified), `search_visual()` (verified mechanically working, but
+  see Phase 3/Phase 4 sections above - 0% accuracy, root cause is the
+  embedding model, fix is Phase 4)
+- `src/pillrag/train_metric_learning.py` - Phase 4, metric-learning
+  training script. STAGE 1 ONLY so far (data loading + train/val
+  split): `load_reference_manifest()`, `decode_rle_mask()`,
+  `make_train_val_split()`. NOT yet run - run and confirm expected
+  counts before building the Dataset class/sampler/model/loss/loop on
+  top of it.
+- `Pill_Retrieval_Design_Report.docx` - user-provided design report
+  that independently arrived at the same root-cause diagnosis
+  (generic ImageNet embeddings lack fine-grained discriminative
+  power) and proposed the metric-learning + Grad-CAM direction. Read
+  via `pandoc -t markdown` (viewing as raw text shows zip binary, not
+  content - it's a real docx, needs pandoc/docx extraction). Reference/
+  inspiration document, NOT followed as a literal spec - some of its
+  recommended ordering (isolate training objective before changing
+  backbone/resolution) was explicitly overridden by user decision, see
+  Phase 4 section above.
 - `notebooks/colab_full_test_setup.py` - two-cell Colab setup for the
   base pipeline (data/model/9 known test cases)
 - `notebooks/setup_deeplake.py` - two-cell Colab setup for Deep Lake
