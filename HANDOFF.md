@@ -71,7 +71,7 @@ tracked follow-up.** Entry point: `pillrag.segment.resolve_pill_mask
   UNRECONCILED - two investigations point opposite ways. Explicit
   decision: proceed anyway, accepted as unquantified risk.
 
-## Phase 3 (embedding + vector search): index is LIVE, query side not built
+## Phase 3 (embedding + vector search): index is LIVE, query side WRITTEN but NOT runtime-verified
 
 **Scope decision**: vector index = reference images ONLY
 (`is_ref==True`, 2,000 rows / 1,000 pill types). Consumer images
@@ -110,14 +110,54 @@ similarity-search index), pilltype_id/label/drug_name/color/shape
 session (Colab Secrets recommended) - NEVER hardcode a token in any
 script.
 
-**NOT yet built:**
-- [ ] **`search_visual`**: takes a raw image, runs `resolve_pill_mask`
-      + `embed_image`, queries the Deep Lake dataset for nearest
-      neighbors, returns matched pilltype_id/label/drug_name. This is
-      the actual next thing to build.
+**`src/pillrag/visual_search.py` - WRITTEN, partially verified:**
+- [x] `segment_query_image(image_path, known_shape, fastsam_model)` -
+      VERIFIED. Live-query segmentation wrapper around
+      `resolve_pill_mask` + `run_fastsam`. Never returns
+      `final_mask=None` - falls back to an all-True full-image mask
+      (flagged via `degraded=True`) if segmentation genuinely fails.
+      Run in Colab against the `round_clean` test case, exact match to
+      the known-good manual `resolve_pill_mask` result: method=single,
+      degraded=False, mask shape (1024,1024), sum=618772.
+- [x] `embed_query_image(image_path, known_shape, fastsam_model)` -
+      VERIFIED. Thin wrapper: segment_query_image -> embed_image.
+      Run in Colab against `round_clean`: method=single, degraded=
+      False, embedding.shape=(512,), dtype=float32 - exact match to
+      expected.
+- [ ] `search_visual(image_path, known_shape, fastsam_model, top_k,
+      dataset_path)` - WRITTEN, NOT YET RUN. Segments, embeds, queries
+      the live Deep Lake dataset via `deeplake.query()` (TQL, embedding
+      formatted as a comma-joined `ARRAY[...]` literal - confirmed
+      against current deeplake docs, not yet run against the real
+      dataset), returns shape-filtered/similarity-ranked matches.
+      **This is the actual next thing to do** - run it once against a
+      known test case (e.g. round_clean, known_shape="ROUND") before
+      trusting it. See DEVLOG.md's "NOT YET VERIFIED" list for the
+      exact open mechanics (WHERE+ORDER BY composition in one TQL
+      query, the `similarity` column alias, DatasetView row-access
+      pattern, single-quote handling).
 - [ ] **Eval script**: run all 3,728 consumer images through
       `search_visual`, check retrieval accuracy against known
-      `pilltype_id`. The real end-to-end test of Phase 2+3.
+      `pilltype_id`. Blocked on `search_visual` being runtime-verified
+      first. The real end-to-end test of Phase 2+3.
+
+**Product decision this session - known_shape is now REQUIRED**, not
+optional, across all three functions above. The user always selects
+their pill's shape from a dropdown before taking the photo - this
+isn't an inferred value, so it doesn't reopen the "don't infer shape
+at query time" concern the Hough fallback's scope note was originally
+about (see the new "don't re-litigate" entry below).
+
+**Product decision this session - shape filtering in search_visual is
+a HARD filter, not a soft boost.** Only rows where `shape ==
+known_shape OR shape == ''` (empty string = Phase 1's missing-metadata
+sentinel) are eligible to appear in results at all - a row with a
+KNOWN, DIFFERENT shape is excluded entirely, never just ranked lower.
+Two other options (no filter, soft similarity-score boost for matching
+shape) were considered and rejected once the actual product
+requirement was confirmed. Known, accepted residual risk: this fixes
+the missing-label case (~3.2% of rows) but not a genuinely WRONG shape
+label - see DEVLOG.md for the full reasoning trail.
 
 ## SAM3 follow-up (tracked, not blocking)
 
@@ -172,6 +212,18 @@ if you want it):
   NDC/text metadata) are deferred, both from text RAG AND visual search
 - Phase 3 index scope: reference-only (see Phase 3 section above) -
   do NOT re-open this, it's verified two independent ways
+- **REVISED, not silently overturned**: `known_shape` at query time.
+  The Hough Circle fallback's offline-only scope note (still true for
+  an INFERRED shape - see segment.py's "IMPORTANT SCOPE NOTE") does
+  NOT apply to a USER-DECLARED shape. The product requires the user to
+  always select shape from a dropdown before taking a photo - this is
+  a real, independently-known input (like telling a pharmacist "it's a
+  round white pill"), not the pipeline inferring shape about itself.
+  `known_shape` is REQUIRED (not `Optional`) everywhere in
+  visual_search.py. Shape filtering in `search_visual` is a HARD
+  filter (`shape == known_shape OR shape == ''`), not a soft boost -
+  see DEVLOG.md for the full reasoning trail on why a soft boost was
+  considered and rejected.
 - `embed_image` signature (image_path+mask, not image_array+mask or
   manifest_row) - decided, built, verified working. Don't re-litigate.
 - Background handling in embed_image: tight bbox crop, no internal
@@ -201,7 +253,11 @@ if you want it):
 - `README.md` - setup instructions for a human developer
 - `src/pillrag/data.py` - Phase 1, `build_pill_dataset()`
 - `src/pillrag/segment.py` - Phase 2, `resolve_pill_mask()`
-- `src/pillrag/embed.py` - Phase 3, `embed_image()`, `mask_bounding_box()`
+- `src/pillrag/embed.py` - Phase 3, `embed_image()`, `mask_bounding_box()`, `run_fastsam()`
+- `src/pillrag/visual_search.py` - Phase 3, live query path:
+  `segment_query_image()` (verified), `embed_query_image()`
+  (verified), `search_visual()` (written, NOT yet runtime-verified -
+  see Phase 3 section above)
 - `notebooks/colab_full_test_setup.py` - two-cell Colab setup for the
   base pipeline (data/model/9 known test cases)
 - `notebooks/setup_deeplake.py` - two-cell Colab setup for Deep Lake

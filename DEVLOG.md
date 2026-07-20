@@ -2628,3 +2628,119 @@ search_visual query function (segment -> embed -> query Deep Lake for
 nearest neighbors), and the eval script running all 3,728 consumer
 images as queries against this index to measure real retrieval
 accuracy - the actual test of whether Phase 2+3 work end to end.
+
+## Phase 3: visual_search.py - segment_query_image() built and verified
+
+New module `src/pillrag/visual_search.py` - the LIVE QUERY segmentation
+wrapper, as opposed to segment.py's Phase 2 offline batch logic. Reuses
+run_fastsam() (from embed.py) and resolve_pill_mask() (from segment.py)
+directly rather than reimplementing either.
+
+**Real decision made this session**: resolve_pill_mask's Hough Circle
+fallback was previously offline-only (see the "IMPORTANT SCOPE NOTE" in
+segment.py / the "don't re-litigate" list in HANDOFF.md) - using an
+INFERRED shape at query time would be circular. That restriction does
+NOT apply to a shape the USER explicitly selects from a dropdown at
+photo-capture time (same as telling a pharmacist "it's a round white
+pill" out loud) - this is a real, independently-known input, not
+something the pipeline inferred about itself. Decision: pass it through
+to resolve_pill_mask's known_shape param. This revises, not silently
+overturns, the prior scope note - HANDOFF.md's "don't re-litigate" list
+updated to reflect this distinction (inferred shape vs. user-declared
+shape).
+
+**segment_query_image() never returns final_mask=None.** If
+resolve_pill_mask (including the Hough fallback, when eligible) finds
+nothing usable, this falls back to an all-True mask covering the whole
+query image, flagged via a `degraded=True` field - so callers always
+get a usable mask, but can tell a genuine pill-shaped segmentation from
+a last-resort whole-image embed and treat match confidence accordingly.
+
+**Verified working (not just "imports cleanly")**: pushed to the repo,
+reinstalled via --force-reinstall + runtime restart, then run against
+the "round_clean" known-good test case:
+
+    method=single
+    degraded=False
+    final_mask.shape=(1024, 1024)
+    final_mask.sum()=618772
+
+Exact match against the same case's already-confirmed manual
+resolve_pill_mask() result from earlier this session - confirms the
+wrapper isn't silently doing anything different from the underlying
+function it calls.
+
+## Phase 3: embed_query_image() and search_visual() built
+
+**embed_query_image()** - thin wrapper: segment_query_image() ->
+embed_image(). Returns a QueryEmbeddingResult (embedding, method,
+degraded) so the segmentation quality that produced the mask is never
+silently lost once it becomes an embedding.
+
+**Verified working** (pushed, reinstalled, re-tested against
+"round_clean", known_shape="ROUND"):
+
+    single False (512,) float32
+
+Exact match to expected (method='single', degraded=False,
+embedding.shape=(512,), dtype=float32) - confirmed via runtime output,
+not assumed.
+
+**Decision: known_shape is now REQUIRED, not optional**, across
+segment_query_image / embed_query_image / search_visual. Product
+requirement - user always selects pill shape from a dropdown before
+taking a photo. This tightens the earlier `str | None` typing to a
+plain `str` everywhere in visual_search.py.
+
+**Decision: shape filtering in search_visual is a HARD filter, not a
+soft re-rank/boost.** Considered three options (hard filter, no
+filter, soft-boost re-ranking) - rejected a plain hard filter first
+(shape metadata is only ~96.8% complete per Phase 1, and a correct
+match with a missing/wrong shape label would become silently
+unreachable), then rejected soft-boost too, once the actual product
+requirement was clarified: user explicitly wants ONLY same-shape (or
+unknown-shape) pills considered, never a different-shape pill
+regardless of visual similarity. Final rule: a row is eligible iff
+`shape == known_shape OR shape == ''` (empty string is Phase 1's
+missing-metadata sentinel, not a real value - see
+upload_to_deeplake.py). Known, accepted residual risk: this fixes the
+MISSING-label case but not the WRONG-label case (e.g. a genuinely
+round pill mislabeled OVAL in Pillbox would still be incorrectly
+excluded) - narrower failure mode than the plain hard-filter version,
+but not eliminated.
+
+**search_visual() built** - segment -> embed -> query Deep Lake ->
+shape-filtered, similarity-ranked matches. Uses `deeplake.query()`
+(module-level function, TQL string in, DatasetView out) with the query
+embedding formatted as `",".join(str(float(c)) for c in embedding)`
+interpolated into a TQL `ARRAY[...]` literal - this pattern was
+confirmed against CURRENT deeplake docs (docs.deeplake.ai/4.1 and
+4.2, both showing this exact embedding-string-to-ARRAY-literal
+approach) before writing, not pulled from memory - given this
+project's prior doc-vs-runtime mismatch on the Embedding column type,
+didn't want to repeat that mistake here. Shape filter and similarity
+ranking are combined in ONE query (`WHERE shape = '...' OR shape = ''`
+alongside `ORDER BY COSINE_SIMILARITY(...)`), not two separate steps -
+means Deep Lake only needs to return top_k rows total, no
+over-fetch-then-filter-in-Python needed.
+
+**NOT YET VERIFIED - needs a real runtime test before trusting it**:
+  - Whether WHERE + ORDER BY COSINE_SIMILARITY compose correctly in
+    one TQL query (docs show each independently, not combined)
+  - Whether the computed `similarity` column alias
+    (`SELECT *, COSINE_SIMILARITY(...) AS similarity`) is actually
+    referenceable via `row["similarity"]` on the returned DatasetView
+  - Whether iterating `for row in view` and indexing `row["column"]`
+    is the correct DatasetView access pattern (inferred from the
+    upload script's `verify_ds[0]["column"]` pattern, not confirmed
+    for a query-result view specifically)
+  - Single-quote handling in the TQL string if a shape value or query
+    param ever contains one (low risk currently - known_shape is
+    dropdown-constrained - but not hardened)
+
+## Immediate next step
+
+Run search_visual() for real against the live dataset (test case:
+round_clean, known_shape="ROUND") and confirm/fix the three unverified
+mechanics above. Then build the eval script over all 3,728 consumer
+images.
