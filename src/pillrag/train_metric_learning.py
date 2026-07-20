@@ -474,16 +474,31 @@ class PillPairDataset(Dataset):
 
         mask = decode_rle_mask(row["rle_size"], row["rle_counts"])
 
+        # Root-cause diagnosis (confirmed via real run, see DEVLOG.md):
+        # Phase 2's masks come from FastSAM, which resizes every input
+        # to its own internal inference resolution (1024x1024)
+        # regardless of the source image's actual size - so
+        # rle_size is ALWAYS [1024, 1024], even for these 224x224
+        # dr_224/dc_224 source images. The mask's coordinate space
+        # does NOT match image_array's shape unless resized first.
+        # This is FastSAM's real behavior, not a bug in Phase 2's
+        # segmentation - the fix belongs here, at the point where a
+        # mask and its image are combined, not upstream.
+        #
+        # Nearest-neighbor (not bilinear/area) is required: mask is
+        # boolean (True=pill/False=background), and any smooth
+        # interpolation would produce fractional edge values that are
+        # neither True nor False - nearest-neighbor is the only
+        # resize mode that preserves a strictly boolean mask.
+        if mask.shape != image_array.shape[:2]:
+            mask = cv2.resize(
+                mask.astype(np.uint8),
+                (image_array.shape[1], image_array.shape[0]),  # cv2 wants (W, H)
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
+
         top, bottom, left, right = mask_bounding_box(mask)
         cropped = image_array[top : bottom + 1, left : right + 1]
-
-        if cropped.size == 0 or 0 in cropped.shape:
-            raise ValueError(
-                f"DIAGNOSTIC idx={idx} full_image_path={row['full_image_path']} "
-                f"image_array.shape={image_array.shape} mask.shape={mask.shape} "
-                f"bbox=(top={top}, bottom={bottom}, left={left}, right={right}) "
-                f"cropped.shape={cropped.shape} rle_size={row['rle_size']}"
-            )
 
         augmented = self.transform(image=cropped)
         image_tensor = augmented["image"]
