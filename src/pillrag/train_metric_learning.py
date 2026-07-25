@@ -160,24 +160,25 @@ TRAIN_VAL_SPLIT_SEED = 42
 N_VAL_PILLTYPES = 200
 
 # Batch size, expressed in PILL TYPES, not images. With exactly 2
-# images/pilltype (verified, see this module's docstring), N=32
-# pilltypes/batch = 64 images/batch.
+# images/pilltype (verified, see this module's docstring), N=48
+# pilltypes/batch = 96 images/batch.
 #
-# REVISED from an initial N=64 (128 images/batch) assumption after a
-# REAL OOM on a Colab T4 (14.56 GiB) - confirmed via actual traceback
-# (see DEVLOG.md): a single forward pass on 128 images at 384x384
-# through ResNet-50 already had 13.85 GiB in use before failing to
-# allocate one more 1.12 GiB tensor. Root cause understood, not just
-# patched blindly: activation memory scales roughly with resolution^2,
-# and 384x384 is ~3x the activation footprint of the usual 224x224
-# ResNet-50 is normally benchmarked at - combined with the large
-# batch size, this was the expected consequence flagged when
-# resolution/backbone/objective were all changed at once (see this
-# module's top docstring). Halved as the first, simplest fix per
-# explicit decision - if 32 still OOMs, the next real options are
-# gradient accumulation or mixed precision (fp16/bf16), not blindly
-# halving again.
-N_PILLTYPES_PER_BATCH = 32
+# HISTORY: originally N=64 (128 images/batch), REVISED DOWN to N=32
+# (64 images/batch) after a REAL OOM on a Colab T4 (14.56 GiB) -
+# confirmed via actual traceback (see DEVLOG.md): a single forward
+# pass on 128 images at 384x384 through ResNet-50 already had 13.85
+# GiB in use before failing to allocate one more 1.12 GiB tensor.
+#
+# REVISED UP to N=48 after migrating to an NVIDIA L4 (24 GiB) via GCP
+# Colab Enterprise - ~1.65x the T4's capacity. This is an ESTIMATE
+# extrapolated from the one real T4 OOM data point (activation memory
+# scales roughly with resolution^2 and batch size), not yet verified
+# on this GPU - deliberately NOT jumping straight back to the
+# known-bad N=64, and NOT assumed correct until this session's actual
+# sanity-check run confirms no OOM at N=48. If 48 still OOMs, or if
+# there's comfortable headroom to spare, adjust again from REAL
+# observed memory usage on this GPU, not from this estimate alone.
+N_PILLTYPES_PER_BATCH = 48
 
 # Verified this session (see this module's docstring): the ONLY
 # reference pilltype_id where BOTH images are quality_flag=
