@@ -25,6 +25,7 @@ dataset decision"):
     - Text metadata recovered for ~96.8% of these via NDC join
 """
 
+import io
 import os
 import re
 import zipfile
@@ -41,6 +42,45 @@ EPILLID_IMAGE_PREFIX_INSIDE_ZIP = "ePillID_data/classification_data/"
 PILLBOX_METADATA_CSV = Path(
     os.environ.get("PILLBOX_METADATA_CSV_PATH", "data/raw/pillbox_metadata.csv")
 )
+
+
+def _is_gcs_path(path) -> bool:
+    """True if path is a gs:// URI, not a local filesystem path."""
+    return str(path).startswith("gs://")
+
+
+def _open_binary_any(path):
+    """Open a file for binary reading, working for BOTH local paths
+    and gs:// URIs.
+
+    REAL BUG FOUND AND FIXED this session (see
+    train_metric_learning.py's matching helpers and DEVLOG.md for the
+    full GCP migration credentials debugging trail this came out of):
+    plain zipfile.ZipFile() and pandas' native gs:// handling do NOT
+    reliably pick up this project's working Application Default
+    Credentials (confirmed: pyarrow's native GCS filesystem raised a
+    real, reproduced PermissionError/UNAUTHENTICATED error even though
+    google.cloud.storage.Client() and gcsfs.GCSFileSystem() both
+    authenticate fine via ADC in the same environment). Fix: for
+    gs:// paths, read the ENTIRE file into an in-memory BytesIO via
+    gcsfs explicitly, then hand callers that in-memory buffer instead
+    of a bare gs:// string - zipfile and pandas both accept a
+    file-like object just as happily as a real local path, and this
+    sidesteps the broken native-GCS-credential code paths entirely.
+
+    NOTE: this reads the whole file into memory - fine for
+    pillbox_metadata.csv (small) and acceptable for epillid_data.zip
+    (read once per build_pill_dataset() call; zipfile.ZipFile needs
+    random access into the archive anyway, which BytesIO supports and
+    a streaming gcsfs handle would not support as cleanly).
+    """
+    if _is_gcs_path(path):
+        import gcsfs
+        fs = gcsfs.GCSFileSystem()
+        with fs.open(str(path).replace("gs://", ""), "rb") as f:
+            return io.BytesIO(f.read())
+    else:
+        return open(path, "rb")
 
 # Pillbox text fields we want to recover per pill - see DEVLOG for why
 # these specific fields (medicine_name, spl_strength, spl_ingredients
@@ -94,7 +134,7 @@ def load_epillid_labels() -> pd.DataFrame:
     scope: NDC-hex-style labels only (the 1,000-pill-type subset),
     with full, verified-resolvable image paths.
     """
-    with zipfile.ZipFile(EPILLID_ZIP) as zf:
+    with zipfile.ZipFile(_open_binary_any(EPILLID_ZIP)) as zf:
         with zf.open(EPILLID_LABELS_INSIDE_ZIP) as f:
             df = pd.read_csv(f)
 
@@ -119,7 +159,7 @@ def load_pillbox_text_lookup() -> pd.DataFrame:
     """Load Pillbox metadata, normalized and de-duplicated to one row
     per unique NDC, ready to join against ePillID's normalized NDCs.
     """
-    df = pd.read_csv(PILLBOX_METADATA_CSV, low_memory=False)
+    df = pd.read_csv(_open_binary_any(PILLBOX_METADATA_CSV), low_memory=False)
     df["ndc_normalized"] = (
         df["product_code"].dropna().astype(str).apply(_normalize_ndc)
     )

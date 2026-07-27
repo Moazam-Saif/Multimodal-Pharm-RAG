@@ -112,10 +112,69 @@ from PIL import Image
 from pycocotools import mask as maskUtils
 from torch.utils.data import Dataset
 
-from pillrag.data import EPILLID_ZIP, build_pill_dataset
+from pillrag.data import EPILLID_ZIP, _open_binary_any, build_pill_dataset
 from pillrag.embed import IMAGENET_MEAN, IMAGENET_STD, mask_bounding_box
 
 TRAIN_RESOLUTION = 384
+
+
+def _is_gcs_path(path: str) -> bool:
+    """True if path is a gs:// URI, not a local filesystem path."""
+    return path.startswith("gs://")
+
+
+def _glob_manifest_paths(pattern: str) -> list[str]:
+    """Glob for manifest chunk files, working for BOTH local paths and
+    gs:// URIs.
+
+    REAL BUG FOUND AND FIXED this session: Python's stdlib glob.glob()
+    does not understand gs:// URIs at all - it only works on local
+    filesystem paths, and silently returns an empty list for a gs://
+    pattern (producing the exact same FileNotFoundError this function
+    used to raise for a genuinely-missing local path, but for a
+    completely different, non-obvious reason). Discovered via a real
+    GCP Colab Enterprise migration - see DEVLOG.md for the full
+    credentials debugging trail that preceded finding this.
+
+    For gs:// patterns, uses gcsfs's own glob (which DOES understand
+    GCS wildcard patterns) instead of the stdlib version.
+    """
+    if _is_gcs_path(pattern):
+        import gcsfs
+        fs = gcsfs.GCSFileSystem()
+        # gcsfs.glob() returns paths WITHOUT the gs:// prefix - add it
+        # back so downstream code (which checks _is_gcs_path) still
+        # recognizes these as GCS paths.
+        return sorted(f"gs://{p}" for p in fs.glob(pattern.replace("gs://", "")))
+    else:
+        return sorted(glob.glob(pattern))
+
+
+def _read_parquet_any(path: str) -> pd.DataFrame:
+    """Read a parquet file, working for BOTH local paths and gs://
+    URIs.
+
+    REAL BUG FOUND AND FIXED this session: pandas/pyarrow's NATIVE
+    gs:// filesystem handling (used automatically when you pass a
+    gs:// string straight to pd.read_parquet) does NOT pick up the
+    Application Default Credentials this project's Python code
+    otherwise uses successfully (confirmed: google.cloud.storage's
+    Client() and gcsfs.GCSFileSystem() both authenticate fine via ADC;
+    pyarrow's own GCS filesystem does not, raising
+    PermissionError: ... UNAUTHENTICATED ... Invalid Credentials, a
+    real, reproduced error - not a guess). Fix: for gs:// paths,
+    explicitly open the file via gcsfs (which DOES use ADC correctly)
+    and hand pandas a real file HANDLE instead of a bare gs:// string -
+    this sidesteps pyarrow's broken native GCS credential handling
+    entirely.
+    """
+    if _is_gcs_path(path):
+        import gcsfs
+        fs = gcsfs.GCSFileSystem()
+        with fs.open(path.replace("gs://", ""), "rb") as f:
+            return pd.read_parquet(f)
+    else:
+        return pd.read_parquet(path)
 
 # ResNet-50's penultimate-layer (post-global-avg-pool) output size -
 # this is what SHIPS as the real embedding after training (same role
@@ -203,15 +262,16 @@ def load_reference_manifest() -> pd.DataFrame:
     manifest's `shape` was passed in as known_shape at segmentation
     time, sourced from the same df originally anyway).
     """
-    chunk_paths = sorted(glob.glob(MANIFEST_GLOB))
+    chunk_paths = _glob_manifest_paths(MANIFEST_GLOB)
     if not chunk_paths:
         raise FileNotFoundError(
             f"No manifest chunks found matching {MANIFEST_GLOB!r} - "
-            f"check PILL_MASK_MANIFEST_GLOB env var / Drive mount."
+            f"check PILL_MASK_MANIFEST_GLOB env var / Drive mount / "
+            f"GCS bucket path and auth."
         )
 
     manifest = pd.concat(
-        [pd.read_parquet(p) for p in chunk_paths],
+        [_read_parquet_any(p) for p in chunk_paths],
         ignore_index=True,
     )
 
@@ -279,7 +339,7 @@ def extract_reference_images(
     already_present = 0
     newly_extracted = 0
 
-    with zipfile.ZipFile(EPILLID_ZIP) as zf:
+    with zipfile.ZipFile(_open_binary_any(EPILLID_ZIP)) as zf:
         for zip_relative_path in zip_relative_paths:
             dest_path = image_root / zip_relative_path
 
