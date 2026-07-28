@@ -107,6 +107,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
+from torch.utils.checkpoint import checkpoint_sequential
 from albumentations.pytorch import ToTensorV2
 from PIL import Image
 from pycocotools import mask as maskUtils
@@ -472,9 +473,9 @@ def build_train_augmentation() -> A.Compose:
             min_height=TRAIN_RESOLUTION,
             min_width=TRAIN_RESOLUTION,
             border_mode=cv2.BORDER_CONSTANT,
-            value=(255, 255, 255),
+            fill=(255, 255, 255),
         ),
-        A.Rotate(limit=180, border_mode=cv2.BORDER_CONSTANT, value=(255, 255, 255), p=0.9),
+        A.Rotate(limit=180, border_mode=cv2.BORDER_CONSTANT, fill=(255, 255, 255), p=0.9),
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
         A.RandomBrightnessContrast(
@@ -504,7 +505,7 @@ def build_eval_augmentation() -> A.Compose:
             min_height=TRAIN_RESOLUTION,
             min_width=TRAIN_RESOLUTION,
             border_mode=cv2.BORDER_CONSTANT,
-            value=(255, 255, 255),
+            fill=(255, 255, 255),
         ),
         A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ToTensorV2(),
@@ -714,6 +715,62 @@ class PillEmbeddingModel(nn.Module):
             nn.Linear(BACKBONE_EMBED_SIZE, PROJECTION_SIZE),
         )
 
+    def _backbone_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the backbone, using GRADIENT CHECKPOINTING during
+        training to reduce peak GPU memory.
+
+        REAL, MEASURED problem this fixes: a real CUDA OOM was hit on
+        an NVIDIA L4 (22.03 GiB usable) at batch size 96 (N=48
+        pilltypes) - NOT just on the smaller T4 as originally seen.
+        The L4 OOM happened with 21.74 GiB already allocated by
+        PyTorch, deep inside a single ResNet-50 forward pass (bn2 of
+        one of the bottleneck blocks) - confirmed via a real
+        traceback, not assumed. The batch-size-based estimate that led
+        to N=48 (extrapolated from the T4's OOM point) turned out to
+        be WRONG - this is real evidence overriding that earlier
+        estimate, not further guessing.
+
+        Gradient checkpointing trades compute for memory: instead of
+        keeping every intermediate activation in memory for the
+        backward pass (what filled up the GPU), each checkpointed
+        segment's activations are DISCARDED after its forward pass and
+        RECOMPUTED on the fly during backward, when actually needed.
+        Net effect: substantially lower peak memory, at the cost of
+        real extra compute time (parts of the forward pass effectively
+        run twice). Applied via torch.utils.checkpoint.checkpoint_sequential,
+        splitting self.backbone's existing nn.Sequential into segments.
+
+        Only checkpoints in TRAINING mode (self.training is True) -
+        checkpointing has no benefit and only adds needless
+        recomputation overhead during pure inference
+        (backbone_embedding() calls under torch.no_grad(), e.g. the
+        sanity check's 4-image sub-batch, or the eventual real
+        embedding/indexing pipeline, where self.eval() should be set).
+
+        NOTE: checks self.training alone, NOT the input tensor's own
+        requires_grad flag - a real, deliberately-caught mistake this
+        session: raw image tensors from a DataLoader typically do NOT
+        have requires_grad=True set (only the model's own parameters
+        do, which is the normal, correct setup for training a model on
+        fixed input data) - checking x.requires_grad here would have
+        silently made checkpointing never activate at all during the
+        exact sanity-check script this was built to fix, since that
+        script's image_batch is a plain, non-grad-tracking tensor.
+        """
+        if self.training:
+            # Split into 4 segments - a reasonable balance between
+            # memory savings (more segments = more activations
+            # discarded) and recomputation overhead (more segments =
+            # more redundant forward-pass work during backward).
+            # requires_grad_() ensures checkpoint_sequential actually
+            # tracks gradients through x even though x itself came in
+            # without requires_grad set - checkpointing needs this to
+            # correctly recompute activations during backward.
+            x = x.requires_grad_(True) if not x.requires_grad else x
+            return checkpoint_sequential(self.backbone, segments=4, input=x, use_reentrant=False)
+        else:
+            return self.backbone(x)
+
     def backbone_embedding(self, x: torch.Tensor) -> torch.Tensor:
         """The real, shippable embedding - L2-normalized 2048-dim
         ResNet-50 features. Does NOT pass through the projection head.
@@ -721,7 +778,7 @@ class PillEmbeddingModel(nn.Module):
         should call, and what gets indexed into Deep Lake / used for
         query-time similarity search - NOT forward()'s output.
         """
-        features = self.backbone(x)
+        features = self._backbone_forward(x)
         features = torch.flatten(features, 1)
         return F.normalize(features, p=2, dim=1)
 
@@ -731,7 +788,7 @@ class PillEmbeddingModel(nn.Module):
         NOT the embedding that gets shipped - see backbone_embedding()
         and this class's docstring.
         """
-        features = self.backbone(x)
+        features = self._backbone_forward(x)
         features = torch.flatten(features, 1)
         projected = self.projection_head(features)
         return F.normalize(projected, p=2, dim=1)
