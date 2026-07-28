@@ -33,19 +33,32 @@ from pathlib import Path
 
 import pandas as pd
 
-EPILLID_ZIP = Path(
-    os.environ.get("EPILLID_ZIP_PATH", "data/raw/epillid_data.zip")
-)
+EPILLID_ZIP = os.environ.get("EPILLID_ZIP_PATH", "data/raw/epillid_data.zip")
 EPILLID_LABELS_INSIDE_ZIP = "ePillID_data/all_labels.csv"
 EPILLID_IMAGE_PREFIX_INSIDE_ZIP = "ePillID_data/classification_data/"
 
-PILLBOX_METADATA_CSV = Path(
-    os.environ.get("PILLBOX_METADATA_CSV_PATH", "data/raw/pillbox_metadata.csv")
+PILLBOX_METADATA_CSV = os.environ.get(
+    "PILLBOX_METADATA_CSV_PATH", "data/raw/pillbox_metadata.csv"
 )
 
 
 def _is_gcs_path(path) -> bool:
-    """True if path is a gs:// URI, not a local filesystem path."""
+    """True if path is a gs:// URI, not a local filesystem path.
+
+    REAL BUG FOUND AND FIXED this session: EPILLID_ZIP and
+    PILLBOX_METADATA_CSV were originally wrapped in pathlib.Path(...)
+    at module load time. pathlib.Path SILENTLY collapses "gs://" down
+    to "gs:/" (double-slash -> single-slash) the moment the string is
+    parsed as a path, since Path is fundamentally a local-filesystem
+    abstraction with no concept of URI scheme double-slashes. This
+    produced a confusing FileNotFoundError for 'gs:/bucket/...' (one
+    slash) that looked like a typo in the path, when the REAL bug was
+    ever wrapping a gs:// URI in Path() at all. Fixed by keeping these
+    as plain strings at module level, and only ever constructing a
+    real pathlib.Path for genuinely-local paths, inside
+    _open_binary_any below - never for a string that might be a gs://
+    URI.
+    """
     return str(path).startswith("gs://")
 
 
@@ -53,13 +66,13 @@ def _open_binary_any(path):
     """Open a file for binary reading, working for BOTH local paths
     and gs:// URIs.
 
-    REAL BUG FOUND AND FIXED this session (see
-    train_metric_learning.py's matching helpers and DEVLOG.md for the
-    full GCP migration credentials debugging trail this came out of):
-    plain zipfile.ZipFile() and pandas' native gs:// handling do NOT
-    reliably pick up this project's working Application Default
-    Credentials (confirmed: pyarrow's native GCS filesystem raised a
-    real, reproduced PermissionError/UNAUTHENTICATED error even though
+    REAL BUG FOUND AND FIXED this session (see train_metric_learning.py's
+    matching helpers and DEVLOG.md for the full GCP migration
+    credentials debugging trail this came out of): plain
+    zipfile.ZipFile() and pandas' native gs:// handling do NOT reliably
+    pick up this project's working Application Default Credentials
+    (confirmed: pyarrow's native GCS filesystem raised a real,
+    reproduced PermissionError/UNAUTHENTICATED error even though
     google.cloud.storage.Client() and gcsfs.GCSFileSystem() both
     authenticate fine via ADC in the same environment). Fix: for
     gs:// paths, read the ENTIRE file into an in-memory BytesIO via
@@ -67,6 +80,10 @@ def _open_binary_any(path):
     of a bare gs:// string - zipfile and pandas both accept a
     file-like object just as happily as a real local path, and this
     sidesteps the broken native-GCS-credential code paths entirely.
+
+    ALSO FIXED this session: path is checked for gs:// BEFORE any
+    pathlib.Path() wrapping happens - see _is_gcs_path's docstring for
+    why wrapping a gs:// URI in Path() silently corrupts it.
 
     NOTE: this reads the whole file into memory - fine for
     pillbox_metadata.csv (small) and acceptable for epillid_data.zip
@@ -80,7 +97,9 @@ def _open_binary_any(path):
         with fs.open(str(path).replace("gs://", ""), "rb") as f:
             return io.BytesIO(f.read())
     else:
-        return open(path, "rb")
+        # Only NOW, for a confirmed-local path, is it safe to
+        # construct a real pathlib.Path and open it normally.
+        return open(Path(path), "rb")
 
 # Pillbox text fields we want to recover per pill - see DEVLOG for why
 # these specific fields (medicine_name, spl_strength, spl_ingredients
